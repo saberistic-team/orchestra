@@ -1,0 +1,35 @@
+{
+  "name": "orchestra",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.20.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "check": "pnpm check:code && pnpm test && pnpm security",
+    "check:code": "pnpm verify:temporal-boundary && pnpm build && pnpm typecheck",
+    "check:quick": "pnpm check:code && pnpm test:unit && pnpm security:audit",
+    "dev": "pnpm --filter @orchestra/contracts build && pnpm --parallel --filter @orchestra/api --filter @orchestra/worker --filter @orchestra/model-worker --filter @orchestra/preview-manager --filter @orchestra/validation-worker --filter @orchestra/web dev",
+    "db:generate": "pnpm --filter @orchestra/database db:generate",
+    "db:migrate": "pnpm --filter @orchestra/database db:migrate",
+    "security": "pnpm verify:images && pnpm security:audit && pnpm security:trivy && pnpm security:prowler",
+    "security:audit": "pnpm audit",
+    "security:prowler": "mkdir -p .reports/prowler && docker run --rm -v \"$PWD:/workspace\" prowlercloud/prowler:5.37.0@sha256:c3833bcb2d4d93aedbedd772e3ec661438e7a9081d2121d60e3fbe8ff4f4100e iac --scan-path /workspace --exclude-path /workspace/node_modules /workspace/.git /workspace/.reports /workspace/apps/api/dist /workspace/apps/worker/dist /workspace/apps/model-worker/dist /workspace/apps/preview-manager/dist /workspace/apps/validation-worker/dist /workspace/apps/web/dist /workspace/packages/contracts/dist /workspace/packages/database/dist --severity critical high --output-directory /workspace/.reports/prowler",
+    "security:trivy": "docker run --rm -v \"$PWD:/workspace\" aquasec/trivy:0.73.0@sha256:7cced7cae583819fc7806d4cbc0dbbc7cad18b99f7d3e235192e6da8c091045c fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --skip-dirs /workspace/node_modules --skip-dirs /workspace/.git --skip-dirs /workspace/apps/api/dist --skip-dirs /workspace/apps/worker/dist --skip-dirs /workspace/apps/model-worker/dist --skip-dirs /workspace/apps/preview-manager/dist --skip-dirs /workspace/apps/validation-worker/dist --skip-dirs /workspace/apps/web/dist --skip-dirs /workspace/packages/contracts/dist --skip-dirs /workspace/packages/database/dist /workspace",
+    "stack:up": "docker compose --env-file .env.example --env-file .env --env-file .env.docker up --build -d",
+    "stack:down": "docker compose --env-file .env.example --env-file .env --env-file .env.docker down",
+    "test": "pnpm test:unit && pnpm test:integration && pnpm test:e2e && pnpm test:flows",
+    "test:e2e": "vitest run --config vitest.config.ts --project e2e",
+    "test:flows": "pnpm --filter @orchestra/contracts build && pnpm --filter @orchestra/api build && pnpm --filter @orchestra/web build && playwright test",
+    "test:integration": "vitest run --config vitest.config.ts --project integration",
+    "test:unit": "vitest run --config vitest.config.ts --project unit",
+    "typecheck": "pnpm -r typecheck",
+    "verify:images": "node scripts/verify-pinned-images.mjs",
+    "verify:temporal-boundary": "node scripts/verify-temporal-boundary.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@testcontainers/postgresql": "^12.0.4",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

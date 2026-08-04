@@ -1,0 +1,24 @@
+{
+  "name": "@orchestra/worker",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/worker.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@orchestra/contracts": "workspace:*",
+    "@orchestra/database": "workspace:*",
+    "@temporalio/activity": "^1.21.1",
+    "@temporalio/worker": "^1.21.1",
+    "@temporalio/workflow": "^1.21.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "tsx": "^4.23.5",
+    "typescript": "^7.0.2"
+  }
+}

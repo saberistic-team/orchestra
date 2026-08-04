@@ -1,0 +1,69 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1785780000000,
+      "tag": "0000_create_projects",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1785782400000,
+      "tag": "0001_delivery_graph",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1785783600000,
+      "tag": "0002_forgejo_delivery",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1785790800000,
+      "tag": "0003_human_in_the_loop",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1785794400000,
+      "tag": "0004_review_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1785798000000,
+      "tag": "0005_preview_evidence",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1785801600000,
+      "tag": "0006_preview_digest_attestation",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1785805200000,
+      "tag": "0007_model_provider_observability",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1785867600000,
+      "tag": "0008_canonical_human_decisions",
+      "breakpoints": true
+    }
+  ]
+}

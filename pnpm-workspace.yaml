@@ -1,0 +1,21 @@
+packages:
+  - apps/*
+  - packages/*
+
+injectWorkspacePackages: true
+
+allowBuilds:
+  '@nestjs/core': true
+  '@swc/core': true
+  cpu-features: true
+  esbuild: true
+  protobufjs: true
+  ssh2: true
+
+minimumReleaseAgeExclude:
+  - tsx@4.23.5
+  - fastify@5.11.2
+
+overrides:
+  esbuild: 0.28.1
+  find-my-way: 9.7.0

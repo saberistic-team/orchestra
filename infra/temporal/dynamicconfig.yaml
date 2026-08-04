@@ -1,0 +1,4 @@
+frontend.workerHeartbeatsEnabled:
+  - value: true
+frontend.listWorkersEnabled:
+  - value: true

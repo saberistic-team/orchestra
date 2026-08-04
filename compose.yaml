@@ -1,0 +1,437 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment: &application-environment
+      # Explicit allowlist: provider credentials never enter application containers.
+      PORT: 3000
+      DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
+      REDIS_URL: redis://redis:6379
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      FORGEJO_URL: http://forgejo:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      temporal:
+        condition: service_started
+    ports: ["127.0.0.1:3000:3000"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    environment:
+      <<: *application-environment
+      ORCHESTRA_WORKER_MODE: project
+    depends_on:
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+
+  project-activity-worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    environment:
+      <<: *application-environment
+      ORCHESTRA_WORKER_MODE: activities
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-ollama}
+      MODEL_INFERENCE_CONCURRENCY: ${MODEL_INFERENCE_CONCURRENCY:-8}
+      MODEL_PROVIDER_MANAGER: ${MODEL_PROVIDER_MANAGER:-}
+      MODEL_PROVIDER_REQUIREMENTS: ${MODEL_PROVIDER_REQUIREMENTS:-}
+      MODEL_PROVIDER_PRODUCT: ${MODEL_PROVIDER_PRODUCT:-}
+      MODEL_PROVIDER_UX: ${MODEL_PROVIDER_UX:-}
+      MODEL_PROVIDER_ARCHITECTURE: ${MODEL_PROVIDER_ARCHITECTURE:-}
+      MODEL_PROVIDER_DATA: ${MODEL_PROVIDER_DATA:-}
+      MODEL_PROVIDER_SECURITY: ${MODEL_PROVIDER_SECURITY:-}
+      MODEL_PROVIDER_PLANNER: ${MODEL_PROVIDER_PLANNER:-}
+      MODEL_PROVIDER_BUILDER: ${MODEL_PROVIDER_BUILDER:-}
+      MODEL_PROVIDER_TEST: ${MODEL_PROVIDER_TEST:-}
+      MODEL_PROVIDER_REVIEWER: ${MODEL_PROVIDER_REVIEWER:-}
+      MODEL_PROVIDER_GATE: ${MODEL_PROVIDER_GATE:-}
+      MODEL_PROVIDER_DEPLOYMENT: ${MODEL_PROVIDER_DEPLOYMENT:-}
+      MODEL_PROVIDER_VALIDATION: ${MODEL_PROVIDER_VALIDATION:-}
+      FORGEJO_PUBLIC_URL: ${FORGEJO_PUBLIC_URL:-http://localhost:3001}
+      FORGEJO_ADMIN_USER: ${FORGEJO_ADMIN_USER:-orchestra-agent}
+      FORGEJO_ADMIN_PASSWORD: ${FORGEJO_ADMIN_PASSWORD:-orchestra-local-admin-change-me}
+      FORGEJO_REPO_PRIVATE: ${FORGEJO_REPO_PRIVATE:-false}
+      FORGEJO_LIFECYCLE_PERMISSIONS: ${FORGEJO_LIFECYCLE_PERMISSIONS:-pull_requests:comment,pull_requests:merge,issues:close,labels:write,projects:write,releases:write,packages:write,wiki:write}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      temporal:
+        condition: service_started
+      forgejo:
+        condition: service_healthy
+      forgejo-bootstrap:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  agent-workers:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      ORCHESTRA_WORKER_MODE: agents
+      AGENT_WORKER_ROLES: all
+    depends_on:
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+
+  model-worker:
+    build:
+      context: .
+      dockerfile: apps/model-worker/Dockerfile
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      MODEL_WORKER_MODE: brains
+      MODEL_WORKER_ROLES: all
+      MODEL_TASK_QUEUE: orchestra-models
+    depends_on:
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+
+  model-routing-worker:
+    build:
+      context: .
+      dockerfile: apps/model-worker/Dockerfile
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      MODEL_WORKER_MODE: routing
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-ollama}
+      MODEL_PROVIDER_MANAGER: ${MODEL_PROVIDER_MANAGER:-}
+      MODEL_PROVIDER_REQUIREMENTS: ${MODEL_PROVIDER_REQUIREMENTS:-}
+      MODEL_PROVIDER_PRODUCT: ${MODEL_PROVIDER_PRODUCT:-}
+      MODEL_PROVIDER_UX: ${MODEL_PROVIDER_UX:-}
+      MODEL_PROVIDER_ARCHITECTURE: ${MODEL_PROVIDER_ARCHITECTURE:-}
+      MODEL_PROVIDER_DATA: ${MODEL_PROVIDER_DATA:-}
+      MODEL_PROVIDER_SECURITY: ${MODEL_PROVIDER_SECURITY:-}
+      MODEL_PROVIDER_PLANNER: ${MODEL_PROVIDER_PLANNER:-}
+      MODEL_PROVIDER_BUILDER: ${MODEL_PROVIDER_BUILDER:-}
+      MODEL_PROVIDER_TEST: ${MODEL_PROVIDER_TEST:-}
+      MODEL_PROVIDER_REVIEWER: ${MODEL_PROVIDER_REVIEWER:-}
+      MODEL_PROVIDER_GATE: ${MODEL_PROVIDER_GATE:-}
+      MODEL_PROVIDER_DEPLOYMENT: ${MODEL_PROVIDER_DEPLOYMENT:-}
+      MODEL_PROVIDER_VALIDATION: ${MODEL_PROVIDER_VALIDATION:-}
+      OLLAMA_MODEL_DEFAULT: ${OLLAMA_MODEL_DEFAULT:-qwen3.5:9b}
+      OLLAMA_MODEL_MANAGER: ${OLLAMA_MODEL_MANAGER:-qwen3.5:9b}
+      OLLAMA_MODEL_REQUIREMENTS: ${OLLAMA_MODEL_REQUIREMENTS:-qwen3.5:9b}
+      OLLAMA_MODEL_PRODUCT: ${OLLAMA_MODEL_PRODUCT:-qwen3.5:9b}
+      OLLAMA_MODEL_UX: ${OLLAMA_MODEL_UX:-qwen3.5:9b}
+      OLLAMA_MODEL_ARCHITECTURE: ${OLLAMA_MODEL_ARCHITECTURE:-qwen3.5:27b}
+      OLLAMA_MODEL_DATA: ${OLLAMA_MODEL_DATA:-qwen3.5:27b}
+      OLLAMA_MODEL_SECURITY: ${OLLAMA_MODEL_SECURITY:-gpt-oss:20b}
+      OLLAMA_MODEL_PLANNER: ${OLLAMA_MODEL_PLANNER:-qwen3.5:27b}
+      OLLAMA_MODEL_BUILDER: ${OLLAMA_MODEL_BUILDER:-qwen2.5-coder:32b}
+      OLLAMA_MODEL_TEST: ${OLLAMA_MODEL_TEST:-qwen2.5-coder:32b}
+      OLLAMA_MODEL_REVIEWER: ${OLLAMA_MODEL_REVIEWER:-gpt-oss:20b}
+      OLLAMA_MODEL_GATE: ${OLLAMA_MODEL_GATE:-gpt-oss:20b}
+      OLLAMA_MODEL_DEPLOYMENT: ${OLLAMA_MODEL_DEPLOYMENT:-gpt-oss:20b}
+      OLLAMA_MODEL_VALIDATION: ${OLLAMA_MODEL_VALIDATION:-qwen3.5:9b}
+      OPENROUTER_MODEL_DEFAULT: ${OPENROUTER_MODEL_DEFAULT:-qwen/qwen3.5-9b}
+      OPENROUTER_MODEL_MANAGER: ${OPENROUTER_MODEL_MANAGER:-openai/gpt-5-mini}
+      OPENROUTER_MODEL_REQUIREMENTS: ${OPENROUTER_MODEL_REQUIREMENTS:-openai/gpt-5-mini}
+      OPENROUTER_MODEL_PRODUCT: ${OPENROUTER_MODEL_PRODUCT:-openai/gpt-5-mini}
+      OPENROUTER_MODEL_UX: ${OPENROUTER_MODEL_UX:-openai/gpt-5-mini}
+      OPENROUTER_MODEL_ARCHITECTURE: ${OPENROUTER_MODEL_ARCHITECTURE:-openai/gpt-5-mini}
+      OPENROUTER_MODEL_DATA: ${OPENROUTER_MODEL_DATA:-openai/gpt-5-mini}
+      OPENROUTER_MODEL_SECURITY: ${OPENROUTER_MODEL_SECURITY:-openai/gpt-oss-120b}
+      OPENROUTER_MODEL_PLANNER: ${OPENROUTER_MODEL_PLANNER:-openai/gpt-5-mini}
+      OPENROUTER_MODEL_BUILDER: ${OPENROUTER_MODEL_BUILDER:-qwen/qwen3-coder}
+      OPENROUTER_MODEL_TEST: ${OPENROUTER_MODEL_TEST:-qwen/qwen3-coder}
+      OPENROUTER_MODEL_REVIEWER: ${OPENROUTER_MODEL_REVIEWER:-anthropic/claude-sonnet-4.6}
+      OPENROUTER_MODEL_GATE: ${OPENROUTER_MODEL_GATE:-openai/gpt-oss-120b}
+      OPENROUTER_MODEL_DEPLOYMENT: ${OPENROUTER_MODEL_DEPLOYMENT:-openai/gpt-oss-120b}
+      OPENROUTER_MODEL_VALIDATION: ${OPENROUTER_MODEL_VALIDATION:-openai/gpt-5-mini}
+    depends_on:
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+
+  ollama-worker:
+    build:
+      context: .
+      dockerfile: apps/model-worker/Dockerfile
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      MODEL_WORKER_MODE: ollama-inference
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_TIMEOUT_MS: ${OLLAMA_TIMEOUT_MS:-1500000}
+      MODEL_MAX_RESPONSE_BYTES: ${MODEL_MAX_RESPONSE_BYTES:-2000000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+
+  openrouter-worker:
+    build:
+      context: .
+      dockerfile: apps/model-worker/Dockerfile
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      MODEL_WORKER_MODE: openrouter-inference
+      MODEL_INFERENCE_CONCURRENCY: ${MODEL_INFERENCE_CONCURRENCY:-8}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_ALLOW_REMOTE_DATA: ${OPENROUTER_ALLOW_REMOTE_DATA:-false}
+      OPENROUTER_ALLOWED_MODELS: ${OPENROUTER_ALLOWED_MODELS:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_TIMEOUT_MS: ${OPENROUTER_TIMEOUT_MS:-}
+      OPENROUTER_IDLE_TIMEOUT_MS: ${OPENROUTER_IDLE_TIMEOUT_MS:-90000}
+      OPENROUTER_MAX_TOKENS: ${OPENROUTER_MAX_TOKENS:-}
+      OPENROUTER_REASONING_MAX_TOKENS: ${OPENROUTER_REASONING_MAX_TOKENS:-}
+      OPENROUTER_HTTP_ATTEMPTS: ${OPENROUTER_HTTP_ATTEMPTS:-2}
+      OPENROUTER_PROVIDER_SORT: ${OPENROUTER_PROVIDER_SORT:-}
+      MODEL_MAX_RESPONSE_BYTES: ${MODEL_MAX_RESPONSE_BYTES:-2000000}
+      OPENROUTER_HTTP_REFERER: ${OPENROUTER_HTTP_REFERER:-}
+      OPENROUTER_APP_TITLE: ${OPENROUTER_APP_TITLE:-Orchestra}
+    depends_on:
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+
+  validation-worker:
+    build:
+      context: .
+      dockerfile: apps/validation-worker/Dockerfile
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      FORGEJO_URL: http://forgejo:3000
+      FORGEJO_PUBLIC_URL: ${FORGEJO_PUBLIC_URL:-http://localhost:3001}
+      FORGEJO_ADMIN_USER: ${FORGEJO_ADMIN_USER:-orchestra-agent}
+      FORGEJO_ADMIN_PASSWORD: ${FORGEJO_ADMIN_PASSWORD:-orchestra-local-admin-change-me}
+      PREVIEW_DEPLOY_WEBHOOK_URL: http://preview-manager:3002/previews
+      PREVIEW_DEPLOY_TOKEN: ${PREVIEW_DEPLOY_TOKEN:-orchestra-local-preview-change-me}
+      PREVIEW_DEPLOY_TIMEOUT_MS: ${PREVIEW_DEPLOY_TIMEOUT_MS:-600000}
+      PREVIEW_GATEWAY_PUBLIC_ORIGIN: ${PREVIEW_GATEWAY_PUBLIC_ORIGIN:-http://localhost:3003}
+      PREVIEW_GATEWAY_INTERNAL_ORIGIN: http://preview-gateway:3003
+    depends_on:
+      temporal:
+        condition: service_started
+      forgejo:
+        condition: service_healthy
+      forgejo-bootstrap:
+        condition: service_completed_successfully
+      preview-manager:
+        condition: service_healthy
+      preview-gateway:
+        condition: service_healthy
+    networks: [default, preview-runtime]
+    restart: unless-stopped
+
+  preview-manager:
+    build:
+      context: .
+      dockerfile: apps/preview-manager/Dockerfile
+    environment:
+      PORT: 3002
+      FORGEJO_URL: http://forgejo:3000
+      FORGEJO_PREVIEW_USER: ${FORGEJO_ADMIN_USER:-orchestra-agent}
+      FORGEJO_PREVIEW_PASSWORD: ${FORGEJO_ADMIN_PASSWORD:-orchestra-local-admin-change-me}
+      PREVIEW_MANAGER_TOKEN: ${PREVIEW_DEPLOY_TOKEN:-orchestra-local-preview-change-me}
+      PREVIEW_RUNTIME_NETWORK: orchestra-preview-runtime
+      PREVIEW_TTL_MS: ${PREVIEW_TTL_MS:-86400000}
+      PREVIEW_MAX_ACTIVE: ${PREVIEW_MAX_ACTIVE:-8}
+      PREVIEW_BUILD_TIMEOUT_MS: ${PREVIEW_BUILD_TIMEOUT_MS:-600000}
+      PREVIEW_HEALTH_TIMEOUT_MS: ${PREVIEW_HEALTH_TIMEOUT_MS:-90000}
+      PREVIEW_BUILD_NETWORK_MODE: ${PREVIEW_BUILD_NETWORK_MODE:-default}
+    depends_on:
+      preview-gateway:
+        condition: service_started
+      forgejo:
+        condition: service_healthy
+      forgejo-bootstrap:
+        condition: service_completed_successfully
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports: ["127.0.0.1:3002:3002"]
+    networks: [default]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3002/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  preview-gateway:
+    build:
+      context: .
+      dockerfile: apps/preview-manager/Dockerfile
+    command: ["node", "dist/preview-gateway.js"]
+    environment:
+      PORT: 3003
+      PREVIEW_GATEWAY_PUBLIC_ORIGIN: ${PREVIEW_GATEWAY_PUBLIC_ORIGIN:-http://localhost:3003}
+    user: "65532:65532"
+    ports: ["127.0.0.1:3003:3003"]
+    # The manager attaches this service to preview-runtime after first start.
+    # Docker Desktop otherwise suppresses this service's localhost port mapping.
+    networks: [preview-ingress]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "const r=require('node:http').request('http://127.0.0.1:3003/health',{headers:{host:'preview-gateway.localhost:3003'}},x=>process.exit(x.statusCode===200?0:1));r.on('error',()=>process.exit(1));r.end()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    environment:
+      API_URL: http://api:3000
+    depends_on:
+      api:
+        condition: service_healthy
+    ports: ["127.0.0.1:8088:8080"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  postgres:
+    build:
+      context: .
+      dockerfile: infra/postgres/Dockerfile
+    environment:
+      POSTGRES_USER: orchestra
+      POSTGRES_PASSWORD: orchestra
+      POSTGRES_DB: orchestra
+    ports: ["127.0.0.1:5432:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orchestra"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    build:
+      context: .
+      dockerfile: infra/redis/Dockerfile
+    ports: ["127.0.0.1:6379:6379"]
+    volumes: [redis-data:/data]
+
+  temporal:
+    build:
+      context: .
+      dockerfile: infra/temporal/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: orchestra
+      POSTGRES_PWD: orchestra
+      POSTGRES_SEEDS: postgres
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development.yaml
+    ports: ["127.0.0.1:7233:7233"]
+
+  temporal-ui:
+    build:
+      context: .
+      dockerfile: infra/temporal-ui/Dockerfile
+    depends_on: [temporal]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports: ["127.0.0.1:8080:8080"]
+
+  forgejo:
+    build:
+      context: .
+      dockerfile: infra/forgejo/Dockerfile
+    environment:
+      FORGEJO__database__DB_TYPE: postgres
+      FORGEJO__database__HOST: postgres:5432
+      FORGEJO__database__NAME: forgejo
+      FORGEJO__database__USER: orchestra
+      FORGEJO__database__PASSWD: orchestra
+      FORGEJO__security__INSTALL_LOCK: "true"
+      FORGEJO__service__DISABLE_REGISTRATION: "true"
+      FORGEJO__server__DOMAIN: localhost
+      FORGEJO__server__ROOT_URL: ${FORGEJO_PUBLIC_URL:-http://localhost:3001}/
+      FORGEJO__server__SSH_DOMAIN: localhost
+      FORGEJO__server__SSH_PORT: 2222
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports: ["127.0.0.1:3001:3000", "127.0.0.1:2222:2222"]
+    volumes: [forgejo-data:/var/lib/gitea]
+
+  forgejo-bootstrap:
+    build:
+      context: .
+      dockerfile: infra/forgejo-bootstrap/Dockerfile
+    environment:
+      FORGEJO__database__DB_TYPE: postgres
+      FORGEJO__database__HOST: postgres:5432
+      FORGEJO__database__NAME: forgejo
+      FORGEJO__database__USER: orchestra
+      FORGEJO__database__PASSWD: orchestra
+      FORGEJO__security__INSTALL_LOCK: "true"
+      FORGEJO_ADMIN_USER: ${FORGEJO_ADMIN_USER:-orchestra-agent}
+      FORGEJO_ADMIN_PASSWORD: ${FORGEJO_ADMIN_PASSWORD:-orchestra-local-admin-change-me}
+      FORGEJO_ADMIN_EMAIL: ${FORGEJO_ADMIN_EMAIL:-agent@orchestra.local}
+    depends_on:
+      forgejo:
+        condition: service_healthy
+    volumes: [forgejo-data:/var/lib/gitea]
+    restart: "no"
+
+volumes:
+  postgres-data:
+  redis-data:
+  forgejo-data:
+
+networks:
+  preview-runtime:
+    name: orchestra-preview-runtime
+    internal: true
+  preview-ingress:
+    name: orchestra-preview-ingress

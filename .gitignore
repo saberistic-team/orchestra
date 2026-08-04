@@ -1,0 +1,8 @@
+node_modules/
+.pnpm-store/
+dist/
+.env
+coverage/
+*.log
+.reports/
+compose.override.yaml

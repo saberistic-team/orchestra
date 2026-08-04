@@ -1,0 +1,31 @@
+{
+  "name": "@orchestra/api",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@nestjs/common": "^11.1.28",
+    "@nestjs/core": "^11.1.28",
+    "@nestjs/platform-fastify": "^11.1.28",
+    "@orchestra/contracts": "workspace:*",
+    "@temporalio/client": "^1.21.1",
+    "fastify": "^5.11.2",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@types/supertest": "^7.2.1",
+    "@nestjs/testing": "^11.1.28",
+    "supertest": "^7.2.2",
+    "tsx": "^4.23.5",
+    "typescript": "^7.0.2"
+  }
+}

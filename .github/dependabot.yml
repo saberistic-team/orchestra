@@ -1,0 +1,28 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      pnpm-workspace:
+        patterns: ['*']
+  - package-ecosystem: docker
+    directories:
+      - /apps/api
+      - /apps/worker
+      - /apps/model-worker
+      - /apps/validation-worker
+      - /apps/web
+      - /infra/postgres
+      - /infra/redis
+      - /infra/temporal
+      - /infra/temporal-ui
+      - /infra/forgejo
+      - /infra/forgejo-bootstrap
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
