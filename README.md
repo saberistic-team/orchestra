@@ -1,6 +1,6 @@
 # Orchestra
 
-Orchestra is an open-source "software shop as a service": a guided interface turns a person's intent into a reviewed, testable software project while specialized agents work behind the scenes.
+Orchestra is a source-available "software shop as a service": a guided interface turns a person's intent into a reviewed, testable software project while specialized agents work behind the scenes.
 
 ## First product slice
 
@@ -15,8 +15,8 @@ Orchestra is an open-source "software shop as a service": a guided interface tur
 
 - `apps/web`: installable React PWA with offline app-shell support and locally saved drafts
 - `apps/api`: NestJS/Fastify control-plane API and Temporal client gateway
-- `apps/worker`: one project-organism workflow, 14 long-lived role actors with durable mailboxes and dedicated queues, plus separately routed persistence and Forgejo activities
-- `apps/model-worker`: one model-interaction child workflow per role/model route; local Ollama uses a singleton serialized inference lane, OpenRouter may run many calls in parallel (`MODEL_PROVIDER`)
+- `apps/worker`: one project-organism workflow, 14 long-lived role actors with durable mailboxes, dedicated queues, and deterministic interpreters for bounded model-planned actions, plus separately routed persistence and Forgejo activities
+- `apps/model-worker`: purpose-specific model-interaction children for planning/repair and artifact authoring/review/revision, with reserved assessment purposes; local Ollama uses a singleton serialized inference lane, OpenRouter may run many calls in parallel (`MODEL_PROVIDER`)
 - `apps/preview-manager`: exact-revision local Docker builds and short-lived, isolated review deployments
 - `apps/validation-worker`: isolated Playwright worker that records real configured previews
 - `packages/contracts`: shared Zod contracts and TypeScript types
@@ -28,7 +28,7 @@ Orchestra is an open-source "software shop as a service": a guided interface tur
 
 All application API calls cross the Temporal boundary. Commands execute workflows, reads use workflow queries, and only worker activities may access durable stores. The local `/health` probe is the sole infrastructure-only exception.
 
-Each project runs an artifact-driven, versioned agent organism. Requirements and Product, UX and Architecture, Data and Security, and Test and Reviewer form parallel-ready branches; Planner and Gate enforce the joins. Deployment and Validation remain visible but dormant until a release is explicitly authorized. The PWA separates the work happening now from the larger permitted relationship network, and turns protocol events into a readable agent-to-agent ledger. See [the delivery graph](docs/DELIVERY_GRAPH.md), [agent organism](docs/AGENT_ORGANISM.md), and [worker topology](docs/WORKER_TOPOLOGY.md) for the complete relationship, authority, and execution model.
+Each project runs an artifact-driven, versioned agent organism. Requirements and Product, UX and Architecture, Data and Security, and Test and Reviewer form parallel-ready branches; Planner and Gate enforce the joins. This outer delivery graph is deterministic. Inside each bounded role order, the first dynamic adapter lets the model choose bounded artifact generation, review, or revision actions while the role workflow validates authority and budgets, records observations, and deterministically verifies completion. The shared registry and scheduler are ready for later repository and delivery capability adapters. Deployment and Validation remain visible and monitoring until a release is explicitly authorized. The PWA renders all persistent actors as a live graph, keeps that context visible behind an agent spotlight, groups typed exchanges by topic, and explains the Manager recommendation separately from mandatory Gate readiness. See [dynamic agent execution](docs/DYNAMIC_AGENT_EXECUTION.md), [the delivery graph](docs/DELIVERY_GRAPH.md), [agent organism](docs/AGENT_ORGANISM.md), and [worker topology](docs/WORKER_TOPOLOGY.md) for the complete relationship, authority, and execution model.
 
 The human review workspace is durable rather than form-only. Agent questions carry understandable options and may explicitly allow “let the agent decide.” Human comments, overall direction, artifact feedback, and one feedback value for every agent are stored with the exact iteration review and supplied to subsequent or retried agent orders. Empty per-agent feedback is preserved as an intentional reviewed value.
 
@@ -57,7 +57,7 @@ Runnable previews are built locally by default. Builder must commit a root `Dock
 
 Generated previews run non-root on a separate internal network with no host mounts or control-plane credentials, a read-only root filesystem, dropped Linux capabilities, `no-new-privileges`, and CPU, memory, PID, log, timeout, and expiry limits. The preview-manager alone mounts the Docker socket. Docker socket access is effectively host-level authority, so this built-in path is for a trusted local development machine; use a dedicated rootless daemon or disposable VM before treating model-generated Dockerfiles as hostile. See [local Docker previews](docs/LOCAL_DOCKER_PREVIEWS.md). `FORGEJO_LIFECYCLE_PERMISSIONS` controls which post-approval repository side effects are enabled.
 
-Before starting agent generations, set `MODEL_PROVIDER` to `ollama` (default) or `openrouter`; `MODEL_PROVIDER_<ROLE>` may override individual roles. For Ollama, make sure it is running on the host and that the `OLLAMA_MODEL_*` models in `.env.example` are installed; its worker and singleton FIFO lane both enforce one active local call. For OpenRouter, set `OPENROUTER_API_KEY`, explicitly acknowledge remote prompt processing with `OPENROUTER_ALLOW_REMOTE_DATA=true`, and optionally configure `OPENROUTER_ALLOWED_MODELS`, `OPENROUTER_MAX_TOKENS`, `OPENROUTER_REASONING_MAX_TOKENS`, and role models. Successful-but-empty or malformed hosted responses are retried within the configured bounded attempt count. Routing, local inference, and hosted inference use separate workers and queues; only the hosted inference worker receives the API key. Each agent delegates reasoning to its own model-interaction child workflow. Local model downloads are never triggered automatically.
+Before starting agent reasoning, set `MODEL_PROVIDER` to `ollama` (default) or `openrouter`; `MODEL_PROVIDER_<ROLE>` may override individual roles. For Ollama, make sure it is running on the host and that the `OLLAMA_MODEL_*` models in `.env.example` are installed; its worker and singleton FIFO lane both enforce one active local call. For OpenRouter, set `OPENROUTER_API_KEY`, explicitly acknowledge remote prompt processing with `OPENROUTER_ALLOW_REMOTE_DATA=true`, and optionally configure `OPENROUTER_ALLOWED_MODELS`, `OPENROUTER_MAX_TOKENS`, `OPENROUTER_REASONING_MAX_TOKENS`, and role models. Successful-but-empty or malformed hosted responses are retried within the configured bounded attempt count. Routing, local inference, and hosted inference use separate workers and queues; only the hosted inference worker receives the API key. Each current planning, repair, authoring, review, or revision request runs through a role-specific model-interaction child workflow; the role workflow remains the durable control plane. Local model downloads are never triggered automatically.
 
 ## Verification
 
@@ -101,3 +101,9 @@ curl -X POST http://localhost:3000/projects \
 - Agents receive narrowly scoped capabilities and never share a working tree.
 - Approval gates are based on impact: product decisions, spending, credentials, production changes, and destructive actions require a human.
 - The UI speaks in outcomes and tradeoffs, while technical detail remains available on demand.
+
+## License
+
+Copyright © 2026 AmirSaber Sharifi, Saberistic LLC.
+
+Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). Noncommercial use is permitted under that license. Commercial use requires a separate paid license — contact [inbox@saberistic.com](mailto:inbox@saberistic.com).
