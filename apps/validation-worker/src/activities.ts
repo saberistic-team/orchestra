@@ -11,7 +11,8 @@ import { chromium, type Video } from 'playwright';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { request as httpRequest } from 'node:http';
+import { request as httpRequest, type IncomingMessage, type RequestOptions } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 
 export interface UserFlowRecording {
   title: string;
@@ -63,6 +64,64 @@ async function requestGatewayHealth(url: URL, host: string) {
 }
 
 export const previewHealthInternals = { requestGatewayHealth };
+
+async function postPreviewDeployment(
+  url: URL,
+  body: unknown,
+  token: string,
+  timeoutMs: number,
+): Promise<{ status: number; text: string }> {
+  const payload = Buffer.from(JSON.stringify(body));
+  const transport = url.protocol === 'https:' ? httpsRequest : httpRequest;
+  const options: RequestOptions = {
+    protocol: url.protocol,
+    hostname: url.hostname,
+    port: url.port || (url.protocol === 'https:' ? 443 : 80),
+    path: `${url.pathname}${url.search}`,
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      'content-length': payload.byteLength,
+      authorization: `Bearer ${token}`,
+    },
+  };
+
+  return await new Promise((resolve, reject) => {
+    const operation = transport(options, (response: IncomingMessage) => {
+      const chunks: Buffer[] = [];
+      let received = 0;
+      response.on('data', (chunk: Buffer) => {
+        received += chunk.byteLength;
+        if (received > 1_000_000) {
+          response.destroy(new Error('Preview deployment adapter response exceeded 1000000 bytes.'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.once('end', () => {
+        clearTimeout(timer);
+        resolve({ status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') });
+      });
+      response.once('error', (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+    const timer = setTimeout(() => {
+      operation.destroy(new Error(`Preview deployment adapter timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+    timer.unref?.();
+    operation.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    operation.write(payload);
+    operation.end();
+  });
+}
+
+export const previewAdapterInternals = { postPreviewDeployment };
 
 function safePreviewIdentifier(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9_.-]+/gu, '-').replace(/^-+|-+$/gu, '').slice(0, 50);
@@ -189,20 +248,21 @@ export async function deployIterationPreview(input: DeployIterationPreviewInput)
     },
     runtime: PREVIEW_RUNTIME_CONTRACT,
   });
-  const response = await fetch(new URL(endpoint), {
-    method: 'POST',
-    headers: {
-      accept: 'application/json',
-      'content-type': 'application/json',
-      authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(request),
-    signal: AbortSignal.timeout(Number(process.env.PREVIEW_DEPLOY_TIMEOUT_MS ?? 600_000)),
-  });
-  if (!response.ok) {
-    throw new Error(`Preview deployment adapter returned ${response.status}: ${(await response.text()).slice(0, 300)}`);
+  const timeoutMs = Number(process.env.PREVIEW_DEPLOY_TIMEOUT_MS ?? 600_000);
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('PREVIEW_DEPLOY_TIMEOUT_MS must be a positive integer.');
   }
-  const parsed = previewDeploymentResultSchema.safeParse(await response.json());
+  const response = await previewAdapterInternals.postPreviewDeployment(new URL(endpoint), request, token, timeoutMs);
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(`Preview deployment adapter returned ${response.status}: ${response.text.slice(0, 300)}`);
+  }
+  let responseBody: unknown;
+  try {
+    responseBody = JSON.parse(response.text);
+  } catch {
+    throw new Error('Preview deployment adapter returned invalid JSON.');
+  }
+  const parsed = previewDeploymentResultSchema.safeParse(responseBody);
   if (!parsed.success) {
     throw new Error(`Preview deployment adapter returned invalid managed evidence: ${parsed.error.issues.map((issue) => issue.path.join('.') || 'result').join(', ')}.`);
   }
@@ -271,17 +331,16 @@ export async function forgejoUpload(project: Project, iteration: ProjectIteratio
     headers,
     signal: AbortSignal.timeout(60_000),
   });
-  let sha: string | undefined;
   if (lookup.status !== 404) {
     if (!lookup.ok) throw new Error(`Forgejo recording lookup returned ${lookup.status}: ${(await lookup.text()).slice(0, 300)}`);
     const existing = await lookup.json() as { sha?: unknown };
     if (typeof existing.sha !== 'string' || !existing.sha) {
       throw new Error(`Forgejo returned existing recording content without a SHA for ${path} on ${evidenceBranch}.`);
     }
-    sha = existing.sha;
+    return forgejoRecordingUrl(project, path, evidenceBranch, publicUrl);
   }
   const response = await fetch(contentUrl, {
-    method: sha ? 'PUT' : 'POST',
+    method: 'POST',
     headers,
     body: JSON.stringify({
       branch: evidenceBranch,
@@ -289,13 +348,51 @@ export async function forgejoUpload(project: Project, iteration: ProjectIteratio
       message: `test: record iteration ${iteration.number} preview flow`,
       author: { name: 'test agent', email: 'test@orchestra.local' },
       committer: { name: 'Orchestra', email: 'agent@orchestra.local' },
-      ...(sha ? { sha } : {}),
     }),
     signal: AbortSignal.timeout(60_000),
   });
-  if (!response.ok) throw new Error(`Forgejo recording upload returned ${response.status}: ${(await response.text()).slice(0, 300)}`);
+  if (!response.ok) {
+    if (response.status !== 409 && response.status !== 422) {
+      throw new Error(`Forgejo recording upload returned ${response.status}: ${(await response.text()).slice(0, 300)}`);
+    }
+    const confirmed = await fetch(lookupUrl, { headers, signal: AbortSignal.timeout(60_000) });
+    if (!confirmed.ok) {
+      throw new Error(`Forgejo could not confirm concurrent recording upload for ${path}: ${confirmed.status} ${(await confirmed.text()).slice(0, 300)}`);
+    }
+  }
+  return forgejoRecordingUrl(project, path, evidenceBranch, publicUrl);
+}
+
+function forgejoRecordingUrl(project: Project, path: string, evidenceBranch: string, publicUrl: string): string {
+  if (!project.repositoryOwner || !project.repositoryName) {
+    throw new Error('Repository delivery context is missing.');
+  }
   const encodedPath = path.split('/').map(encodeURIComponent).join('/');
   return `${publicUrl}/${encodeURIComponent(project.repositoryOwner)}/${encodeURIComponent(project.repositoryName)}/raw/branch/${encodeURIComponent(evidenceBranch)}/${encodedPath}`;
+}
+
+/** Returns the immutable revision-bound recording when an earlier attempt already committed it. */
+export async function findForgejoUpload(
+  project: Project,
+  iteration: ProjectIteration,
+  path: string,
+): Promise<string | undefined> {
+  if (!project.repositoryOwner || !project.repositoryName || !iteration.branchName) throw new Error('Repository delivery context is missing.');
+  const internalUrl = process.env.FORGEJO_URL ?? 'http://forgejo:3000';
+  const publicUrl = process.env.FORGEJO_PUBLIC_URL ?? 'http://localhost:3001';
+  const headers = forgejoHeaders();
+  const evidenceBranch = await ensureEvidenceBranch(project, iteration, internalUrl, headers);
+  const contentPath = `/api/v1/repos/${encodeURIComponent(project.repositoryOwner)}/${encodeURIComponent(project.repositoryName)}/contents/${path.split('/').map(encodeURIComponent).join('/')}`;
+  const lookupUrl = new URL(contentPath, internalUrl);
+  lookupUrl.searchParams.set('ref', evidenceBranch);
+  const lookup = await fetch(lookupUrl, { headers, signal: AbortSignal.timeout(60_000) });
+  if (lookup.status === 404) return undefined;
+  if (!lookup.ok) throw new Error(`Forgejo recording lookup returned ${lookup.status}: ${(await lookup.text()).slice(0, 300)}`);
+  const existing = await lookup.json() as { sha?: unknown };
+  if (typeof existing.sha !== 'string' || !existing.sha) {
+    throw new Error(`Forgejo returned existing recording content without a SHA for ${path} on ${evidenceBranch}.`);
+  }
+  return forgejoRecordingUrl(project, path, evidenceBranch, publicUrl);
 }
 
 export function isAllowedPreviewRequestUrl(value: string, allowedOrigin: string): boolean {
@@ -339,6 +436,11 @@ export async function captureUserFlow(input: CaptureUserFlowInput): Promise<User
   );
   if (target.hostname !== expectedHostname || target.port !== '8080') {
     throw new Error('Preview recording target is outside the isolated preview network.');
+  }
+  const path = `artifacts/iteration-${String(input.iteration.number).padStart(2, '0')}/preview-smoke-flow-${preview.revision.slice(0, 12)}.webm`;
+  const existingRecordingUrl = await findForgejoUpload(input.project, input.iteration, path);
+  if (existingRecordingUrl) {
+    return { title: 'Latest preview smoke flow', url: existingRecordingUrl, revision: preview.revision };
   }
   const allowedOrigin = target.origin;
   const directory = await mkdtemp(join(tmpdir(), 'orchestra-flow-'));
@@ -396,7 +498,6 @@ export async function captureUserFlow(input: CaptureUserFlowInput): Promise<User
       await browser.close();
     }
     if (!videoPath) throw new Error('Playwright did not produce a user-flow recording.');
-    const path = `artifacts/iteration-${String(input.iteration.number).padStart(2, '0')}/preview-smoke-flow-${preview.revision.slice(0, 12)}.webm`;
     const url = await forgejoUpload(input.project, input.iteration, path, await readFile(videoPath));
     return { title: 'Latest preview smoke flow', url, revision: preview.revision };
   } finally {

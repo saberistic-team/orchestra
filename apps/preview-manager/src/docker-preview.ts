@@ -80,12 +80,24 @@ export function previewContainerOptions(input: {
 }
 
 async function followBuild(docker: Docker, stream: NodeJS.ReadableStream) {
+  type BuildOutput = { error?: string; errorDetail?: { message?: string } };
+  type BuildProgress = { stream?: string; status?: string; id?: string };
+  const buildkitAwareDocker = docker as Docker & {
+    followProgress(
+      source: NodeJS.ReadableStream,
+      finished: (error: Error | null, output: BuildOutput[]) => void,
+      progress?: (entry: BuildProgress) => void,
+    ): void;
+  };
   return new Promise<void>((resolve, reject) => {
-    docker.modem.followProgress(stream, (error: Error | null, output: Array<{ error?: string; errorDetail?: { message?: string } }>) => {
+    buildkitAwareDocker.followProgress(stream, (error: Error | null, output: BuildOutput[]) => {
       if (error) return reject(error);
       const embedded = output?.find((entry) => entry.errorDetail?.message || entry.error);
       if (embedded) return reject(new Error((embedded.errorDetail?.message ?? embedded.error ?? 'Docker build failed.').slice(0, 2_000)));
       resolve();
+    }, (entry: BuildProgress) => {
+      const update = (entry.stream ?? entry.status ?? '').replace(/[\u0000-\u001f\u007f]+/gu, ' ').trim();
+      if (update) console.info(`[preview-build] ${entry.id ? `${entry.id}: ` : ''}${update.slice(0, 500)}`);
     });
   });
 }
@@ -287,7 +299,6 @@ export class DockerPreviewManager {
       const stream = await this.docker.buildImage(source.context as unknown as NodeJS.ReadableStream, {
         t: image,
         dockerfile: 'Dockerfile',
-        version: '2',
         pull: true,
         rm: true,
         forcerm: true,

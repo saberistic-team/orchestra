@@ -1,5 +1,15 @@
 import {
   organismAgentRoles,
+  type AgentExecutionState,
+  type AgentInteraction,
+  type AgentInteractionKind,
+  type AgentMessage,
+  type AgentOrder,
+  type AgentRuntimeSnapshot,
+  type AgentActionPlanRecord,
+  type AgentActionRecord,
+  type AgentGoalRecord,
+  type AgentObligationRecord,
   type AgentArtifactDraft,
   type AgentComment,
   type AgentCommentInput,
@@ -10,7 +20,12 @@ import {
   type AgentRole,
   type ArtifactFeedback,
   type ArtifactFeedbackInput,
+  type ArtifactVersionRecord,
+  type DynamicExecutionTrace,
+  type FindingRecord,
   type IterationReview,
+  type IterationReviewProposal,
+  type IterationReviewBudgetSnapshot,
   type IterationReviewRecord,
   type Project,
   type ProjectArtifact,
@@ -21,16 +36,20 @@ import {
   type ProjectMedia,
   type ProjectStatus,
   type ProjectSummary,
+  type ModelInvocationRecord,
   type RepositoryLifecycleInput,
   type RepositoryLifecycleRecord,
+  type RepositoryOperationRecord,
 } from '@orchestra/contracts';
-import { and, count, desc, eq, inArray, max } from 'drizzle-orm';
+import { and, count, desc, eq, inArray, isNull, max, ne, sql } from 'drizzle-orm';
 import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { Pool } from 'pg';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import * as schema from './schema.js';
+
+const FINDING_REPEAT_COOLDOWN_MS = 30_000;
 
 export function normalizeDecisionKey(value: string) {
   const raw = value.toLowerCase().trim();
@@ -145,6 +164,233 @@ type AddProjectMediaInput = Omit<
   'id' | 'createdAt' | 'sourceRevision' | 'imageDigest' | 'expiresAt'
 > & Partial<Pick<ProjectMedia, 'sourceRevision' | 'imageDigest' | 'expiresAt'>>;
 
+export interface RecordAgentRuntimeStateInput {
+  projectId: string;
+  iterationId?: string | null;
+  role: AgentRole;
+  state: AgentExecutionState;
+  stateVersion: number;
+  activity?: { type: string; summary: string } | null;
+  waitingReason?: string;
+  blockerReferences?: string[];
+  modelProvider?: 'ollama' | 'openrouter';
+  model?: string;
+  workflowRunId?: string;
+  correlationId?: string;
+  operationKey: string;
+  enteredAt?: string;
+}
+
+export interface RecordIterationReviewProposalInput {
+  projectId: string;
+  iterationId: string;
+  iterationNumber: number;
+  includedRevision: string;
+  objectiveStatus: IterationReviewProposal['objectiveStatus'];
+  completedOutcomes: string[];
+  openFindings: IterationReviewProposal['openFindings'];
+  agentPositions: IterationReviewProposal['agentPositions'];
+  gateStatus: IterationReviewProposal['gateStatus'];
+  gateRationale: string;
+  managerRationale: string;
+  recommendation: IterationReviewProposal['recommendation'];
+  knownLimitations: string[];
+  budgetSnapshot: IterationReviewBudgetSnapshot;
+  correlationId: string;
+  operationKey: string;
+}
+
+export type AgentMessageTransition = 'delivered' | 'acknowledged' | 'completed' | 'failed';
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function numericLedgerValue(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function messagePayloadSummary(payload: unknown): string | undefined {
+  if (!isRecord(payload)) return undefined;
+  const summary = payload.summary;
+  if (typeof summary === 'string' && summary.trim()) return summary.trim();
+  const input = payload.input;
+  if (isRecord(input)) {
+    const artifactName = input.artifactName;
+    if (typeof artifactName === 'string' && artifactName.trim()) return `Execute the bounded ${artifactName.trim()} order.`;
+  }
+  return undefined;
+}
+
+function messagePayloadIterationNumber(payload: unknown): number | undefined {
+  if (!isRecord(payload) || !isRecord(payload.input) || !isRecord(payload.input.iteration)) return undefined;
+  const number = payload.input.iteration.number;
+  return typeof number === 'number' && Number.isInteger(number) && number > 0 ? number : undefined;
+}
+
+function safeMessagePayload(payload: unknown): Record<string, unknown> {
+  if (isRecord(payload)) return payload;
+  return payload === undefined ? {} : { value: payload };
+}
+
+function protocolMessageType(message: AgentMessage): typeof schema.agentMessageTypes[number] {
+  if (message.name.includes('review.proposal')) return 'review_proposal';
+  if (message.name.includes('revision')) return 'revision_request';
+  if (message.name.includes('handoff')) return 'handoff';
+  if (message.name.includes('acknowledge')) return 'acknowledgement';
+  const kinds: Record<AgentMessage['kind'], typeof schema.agentMessageTypes[number]> = {
+    COMMAND: 'order',
+    EVENT: 'status',
+    QUESTION: 'question',
+    RESPONSE: 'answer',
+    DECISION: 'decision',
+    EVIDENCE: 'evidence',
+    FINDING: 'finding',
+    STATUS: 'status',
+    ESCALATION: 'blocker',
+    CONTROL: 'request',
+  };
+  return kinds[message.kind];
+}
+
+function sourceOperationKey(table: string, id: string, suffix?: string): string {
+  return `v1:source:${table}:${id}${suffix ? `:${suffix}` : ''}`;
+}
+
+function canonicalJson(value: unknown): string {
+  const canonicalize = (input: unknown): unknown => {
+    if (Array.isArray(input)) return input.map(canonicalize);
+    if (!isRecord(input)) return input;
+    return Object.fromEntries(Object.entries(input)
+      .filter(([, child]) => child !== undefined)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, child]) => [key, canonicalize(child)]));
+  };
+  return JSON.stringify(canonicalize(value));
+}
+
+function dynamicExecutionModelInvocationOperationKey(
+  executionId: string,
+  invocationIndex: number,
+): string {
+  const executionKey = createHash('sha256').update(executionId).digest('hex');
+  return `v1:dynamic-execution:${executionKey}:model-invocation:${invocationIndex}`;
+}
+
+export interface AddArtifactPersistenceOptions {
+  /** Hash of the complete root draft, including attachments and questions. */
+  operationManifestHash?: string;
+  /** Stable root identity used to distinguish otherwise identical model calls. */
+  modelInvocationOperationPrefix?: string;
+  /** Dynamic execution identity shared with terminal-state invocation auditing. */
+  modelInvocationExecutionId?: string;
+  /** Complete private root snapshot used to resume an interrupted operation. */
+  operationPayload?: AgentArtifactDraft;
+  /** Keep the artifact non-reviewable until its repository location is durable. */
+  stageForRepository?: boolean;
+  /** Durable storage intent; ledger-only evidence must not be swept into Git. */
+  storage?: 'repository' | 'ledger';
+  /** Immutable candidate revision this evidence attests. */
+  sourceRevision?: string;
+}
+
+export interface ArtifactOperationRecoveryEnvelope {
+  iterationId: string;
+  type: string;
+  producedBy: AgentRole;
+  storage: 'repository' | 'ledger';
+  sourceRevision: string | null;
+}
+
+export interface CompleteArtifactPersistenceOptions {
+  executionTrace?: AgentArtifactDraft['executionTrace'];
+  iterationNumber: number | null;
+  eventOperationKey?: string;
+}
+
+function assertCompatibleArtifactReplay(
+  row: typeof schema.artifacts.$inferSelect,
+  projectId: string,
+  iterationId: string,
+  draft: AgentArtifactDraft,
+  operationKey: string,
+  options?: AddArtifactPersistenceOptions,
+): void {
+  if (row.projectId !== projectId
+    || row.iterationId !== iterationId
+    || row.type !== draft.type
+    || row.name !== draft.name
+    || row.content !== draft.content
+    || row.mimeType !== draft.mimeType
+    || row.producedBy !== draft.producedBy
+    || row.model !== (draft.model ?? null)
+    || row.modelProvider !== (draft.modelProvider ?? null)
+    || canonicalJson(row.modelInvocations ?? null) !== canonicalJson(draft.modelInvocations ?? null)
+    || row.operationManifestHash !== (options?.operationManifestHash ?? null)
+    || row.storageMode !== (options?.storage ?? 'repository')
+    || (!options?.stageForRepository
+      && canonicalJson(row.executionTrace ?? null) !== canonicalJson(draft.executionTrace ?? null))) {
+    throw new Error(`Artifact operation ${operationKey} was already used with a different payload.`);
+  }
+}
+
+function repositoryOperationStatus(
+  status: RepositoryLifecycleInput['status'],
+): typeof schema.repositoryOperationStatuses[number] {
+  return status === 'pending' ? 'queued' : status;
+}
+
+function repositoryOperationIsMutating(kind: RepositoryLifecycleInput['kind']): boolean {
+  return [
+    'branch_created',
+    'pull_request_opened',
+    'pull_request_updated',
+    'pull_request_merged',
+    'deployment_started',
+    'deployment_completed',
+    'repository_archived',
+  ].includes(kind);
+}
+
+function repositoryOperationValues(
+  row: typeof schema.repositoryLifecycleRecords.$inferSelect,
+): typeof schema.repositoryOperations.$inferInsert {
+  const metadata = row.metadata;
+  const metadataString = (...keys: string[]) => {
+    for (const key of keys) {
+      const value = metadata[key];
+      if (typeof value === 'string' && value.trim()) return value;
+    }
+    return null;
+  };
+  const rawPaths = metadata.paths;
+  const paths = Array.isArray(rawPaths)
+    ? rawPaths.filter((path): path is string => typeof path === 'string')
+    : [];
+  return {
+    projectId: row.projectId,
+    iterationId: row.iterationId,
+    lifecycleRecordId: row.id,
+    type: row.kind,
+    status: repositoryOperationStatus(row.status),
+    mutating: repositoryOperationIsMutating(row.kind),
+    repositoryUrl: row.repositoryUrl,
+    branchName: metadataString('branchName', 'branch')
+      ?? (row.kind === 'branch_created' ? row.externalId : null),
+    paths,
+    expectedBaseRevision: metadataString('expectedBaseRevision', 'baseRevision'),
+    resultingRevision: metadataString('resultingRevision', 'revision', 'commitSha'),
+    externalId: row.externalId,
+    summary: row.summary,
+    metadata: { ...metadata, source: 'repository_lifecycle_records' },
+    correlationId: row.operationKey,
+    operationKey: sourceOperationKey('repository_lifecycle_records', row.id),
+    createdAt: row.createdAt,
+    startedAt: row.createdAt,
+    completedAt: row.status === 'pending' ? null : row.createdAt,
+  };
+}
+
 export class ProjectStore {
   private readonly pool: Pool;
   private readonly database: NodePgDatabase<typeof schema>;
@@ -158,6 +404,64 @@ export class ProjectStore {
     await migrate(this.database, { migrationsFolder });
   }
 
+  async storeTemporalPayload(
+    digest: string,
+    dataBase64: string,
+    metadata: Record<string, string>,
+    byteLength: number,
+  ): Promise<void> {
+    const inserted = await this.database.insert(schema.temporalPayloadBlobs).values({
+      digest,
+      dataBase64,
+      metadata,
+      byteLength,
+    }).onConflictDoNothing().returning({ digest: schema.temporalPayloadBlobs.digest });
+    if (inserted.length > 0) return;
+    const [existing] = await this.database.select({
+      dataBase64: schema.temporalPayloadBlobs.dataBase64,
+      metadata: schema.temporalPayloadBlobs.metadata,
+      byteLength: schema.temporalPayloadBlobs.byteLength,
+    }).from(schema.temporalPayloadBlobs).where(eq(schema.temporalPayloadBlobs.digest, digest)).limit(1);
+    if (!existing
+      || existing.dataBase64 !== dataBase64
+      || existing.byteLength !== byteLength
+      || canonicalJson(existing.metadata) !== canonicalJson(metadata)) {
+      throw new Error(`Temporal payload digest collision or corrupt stored value: ${digest}`);
+    }
+  }
+
+  async loadTemporalPayloads(digests: string[]): Promise<Array<{
+    digest: string;
+    dataBase64: string;
+    metadata: Record<string, string>;
+    byteLength: number;
+  }>> {
+    if (digests.length === 0) return [];
+    return this.database.select({
+      digest: schema.temporalPayloadBlobs.digest,
+      dataBase64: schema.temporalPayloadBlobs.dataBase64,
+      metadata: schema.temporalPayloadBlobs.metadata,
+      byteLength: schema.temporalPayloadBlobs.byteLength,
+    }).from(schema.temporalPayloadBlobs).where(inArray(schema.temporalPayloadBlobs.digest, digests));
+  }
+
+  async artifactContent(projectId: string, artifactId: string, version?: number): Promise<{
+    content: string;
+    version: number;
+    mimeType: string;
+  } | undefined> {
+    const [artifact] = await this.database.select({
+      content: schema.artifacts.content,
+      version: schema.artifacts.version,
+      mimeType: schema.artifacts.mimeType,
+    }).from(schema.artifacts).where(and(
+      eq(schema.artifacts.projectId, projectId),
+      eq(schema.artifacts.id, artifactId),
+      ...(version === undefined ? [] : [eq(schema.artifacts.version, version)]),
+    )).limit(1);
+    return artifact;
+  }
+
   async create(brief: ProjectBrief): Promise<Project> {
     const row = await this.database.transaction(async (transaction) => {
       const [project] = await transaction.insert(schema.projects).values(brief).returning();
@@ -166,14 +470,47 @@ export class ProjectStore {
         number: 1,
         objective: 'Turn the initial intent into an approved, testable first increment.',
       }).returning();
-      await transaction.insert(schema.artifacts).values({
+      const createdAgents = await transaction.insert(schema.agents).values(organismAgentRoles.map((role) => ({
+        projectId: project.id,
+        role,
+        workflowId: `project/${project.id}/agent/${role}`,
+        lifecycleStatus: 'active' as const,
+      }))).returning();
+      await transaction.insert(schema.agentRuntimeStates).values(createdAgents.map((agent) => ({
+        projectId: project.id,
+        iterationId: iteration.id,
+        agentId: agent.id,
+        state: 'observing' as const,
+        stateVersion: 0,
+        activityType: 'project_observation',
+        activitySummary: 'Observing the project for relevant changes.',
+        correlationId: `project:${project.id}:bootstrap`,
+        operationKey: `${agent.workflowId}:state:0`,
+      })));
+      const intentContent = this.intentArtifact(brief);
+      const [intentArtifact] = await transaction.insert(schema.artifacts).values({
         projectId: project.id,
         iterationId: iteration.id,
         type: 'project-intent',
         name: 'Project intent',
-        content: this.intentArtifact(brief),
+        content: intentContent,
         mimeType: 'text/markdown',
         producedBy: 'manager',
+      }).returning();
+      const manager = createdAgents.find((agent) => agent.role === 'manager');
+      await transaction.insert(schema.artifactVersions).values({
+        projectId: project.id,
+        iterationId: iteration.id,
+        artifactId: intentArtifact.id,
+        producedByAgentId: manager?.id ?? null,
+        version: intentArtifact.version,
+        status: intentArtifact.status,
+        content: intentArtifact.content,
+        mimeType: intentArtifact.mimeType,
+        contentHash: `sha256:${createHash('sha256').update(intentContent).digest('hex')}`,
+        metadata: { source: 'project_artifacts', producedBy: 'manager' },
+        operationKey: sourceOperationKey('project_artifacts', intentArtifact.id),
+        createdAt: intentArtifact.createdAt,
       });
       await transaction.insert(schema.projectEvents).values({
         projectId: project.id,
@@ -211,7 +548,28 @@ export class ProjectStore {
   async detail(id: string): Promise<ProjectDetail | undefined> {
     const project = await this.find(id);
     if (!project) return undefined;
-    const [iterationRows, eventRows, artifactRows, mediaRows, questions, agentComments, artifactFeedback, iterationReviews] = await Promise.all([
+    const [
+      iterationRows,
+      eventRows,
+      artifactRows,
+      mediaRows,
+      questions,
+      agentComments,
+      artifactFeedback,
+      iterationReviews,
+      agentRuntimeSnapshots,
+      agentMessages,
+      iterationReviewProposals,
+      agentRows,
+      agentGoalRows,
+      agentActionPlanRows,
+      agentActionRows,
+      agentObligationRows,
+      artifactVersionRows,
+      findingRows,
+      modelInvocationRows,
+      repositoryOperationRows,
+    ] = await Promise.all([
       this.database.select().from(schema.iterations).where(eq(schema.iterations.projectId, id)).orderBy(desc(schema.iterations.number)),
       this.database.select().from(schema.projectEvents).where(eq(schema.projectEvents.projectId, id)).orderBy(desc(schema.projectEvents.createdAt)),
       this.database.select().from(schema.artifacts).where(eq(schema.artifacts.projectId, id)).orderBy(desc(schema.artifacts.createdAt)),
@@ -220,7 +578,21 @@ export class ProjectStore {
       this.listAgentComments(id),
       this.listArtifactFeedback(id),
       this.listIterationReviews(id),
+      this.listAgentRuntimeSnapshots(id),
+      this.listAgentMessages(id),
+      this.listIterationReviewProposals(id),
+      this.database.select().from(schema.agents).where(eq(schema.agents.projectId, id)),
+      this.database.select().from(schema.agentGoals).where(eq(schema.agentGoals.projectId, id)).orderBy(desc(schema.agentGoals.updatedAt)),
+      this.database.select().from(schema.agentActionPlans).where(eq(schema.agentActionPlans.projectId, id)).orderBy(desc(schema.agentActionPlans.updatedAt)),
+      this.database.select().from(schema.agentActions).where(eq(schema.agentActions.projectId, id)).orderBy(desc(schema.agentActions.updatedAt)),
+      this.database.select().from(schema.agentObligations).where(eq(schema.agentObligations.projectId, id)).orderBy(desc(schema.agentObligations.updatedAt)),
+      this.database.select().from(schema.artifactVersions).where(eq(schema.artifactVersions.projectId, id)).orderBy(desc(schema.artifactVersions.createdAt)),
+      this.database.select().from(schema.findings).where(eq(schema.findings.projectId, id)).orderBy(desc(schema.findings.updatedAt)),
+      this.database.select().from(schema.modelInvocations).where(eq(schema.modelInvocations.projectId, id)).orderBy(desc(schema.modelInvocations.createdAt)),
+      this.database.select().from(schema.repositoryOperations).where(eq(schema.repositoryOperations.projectId, id)).orderBy(desc(schema.repositoryOperations.createdAt)),
     ]);
+    const roleByAgentId = new Map(agentRows.map((agent) => [agent.id, agent.role]));
+    const artifactById = new Map(artifactRows.map((artifact) => [artifact.id, artifact]));
     return {
       project,
       iterations: iterationRows.map((row) => this.toIteration(row)),
@@ -231,7 +603,839 @@ export class ProjectStore {
       agentComments,
       artifactFeedback,
       iterationReviews,
+      agentRuntimeSnapshots,
+      agentMessages,
+      iterationReviewProposals,
+      agentGoals: agentGoalRows.map((row) => this.toAgentGoal(row, roleByAgentId.get(row.agentId)!)),
+      agentActionPlans: agentActionPlanRows.map((row) => this.toAgentActionPlan(row, roleByAgentId.get(row.agentId)!)),
+      agentActions: agentActionRows.map((row) => this.toAgentAction(row, roleByAgentId.get(row.agentId)!)),
+      agentObligations: agentObligationRows.map((row) => this.toAgentObligation(row, roleByAgentId.get(row.ownerAgentId)!)),
+      artifactVersions: artifactVersionRows.map((row) => {
+        const artifact = artifactById.get(row.artifactId);
+        return this.toArtifactVersion(
+          row,
+          artifact?.type ?? 'unknown',
+          artifact?.name ?? row.artifactId,
+          row.producedByAgentId ? roleByAgentId.get(row.producedByAgentId) ?? null : null,
+        );
+      }),
+      findings: findingRows.map((row) => this.toFinding(
+        row,
+        row.raisedByAgentId ? roleByAgentId.get(row.raisedByAgentId) ?? null : null,
+        row.ownerAgentId ? roleByAgentId.get(row.ownerAgentId) ?? null : null,
+      )),
+      modelInvocations: modelInvocationRows.map((row) => this.toModelInvocation(
+        row,
+        row.agentId ? roleByAgentId.get(row.agentId) ?? null : null,
+      )),
+      repositoryOperations: repositoryOperationRows.map((row) => this.toRepositoryOperation(
+        row,
+        row.agentId ? roleByAgentId.get(row.agentId) ?? null : null,
+      )),
     };
+  }
+
+  async ensureAgent(projectId: string, role: AgentRole) {
+    const workflowId = `project/${projectId}/agent/${role}`;
+    const [agent] = await this.database.insert(schema.agents).values({
+      projectId,
+      role,
+      workflowId,
+      lifecycleStatus: 'active',
+    }).onConflictDoUpdate({
+      target: [schema.agents.projectId, schema.agents.role],
+      set: { workflowId, lifecycleStatus: 'active', updatedAt: new Date() },
+    }).returning();
+    return agent;
+  }
+
+  async recordAgentRuntimeState(input: RecordAgentRuntimeStateInput): Promise<AgentRuntimeSnapshot> {
+    const agent = await this.ensureAgent(input.projectId, input.role);
+    const [existing] = await this.database.select().from(schema.agentRuntimeStates).where(and(
+      eq(schema.agentRuntimeStates.projectId, input.projectId),
+      eq(schema.agentRuntimeStates.operationKey, input.operationKey),
+    )).limit(1);
+    if (existing) return this.toAgentRuntimeSnapshot(input.role, existing);
+
+    const enteredAt = input.enteredAt ? new Date(input.enteredAt) : new Date();
+    if (Number.isNaN(enteredAt.getTime())) throw new Error('Agent runtime enteredAt must be a valid timestamp.');
+    const row = await this.database.transaction(async (transaction) => {
+      await transaction.update(schema.agentRuntimeStates).set({ exitedAt: enteredAt }).where(and(
+        eq(schema.agentRuntimeStates.agentId, agent.id),
+        isNull(schema.agentRuntimeStates.exitedAt),
+      ));
+      const [created] = await transaction.insert(schema.agentRuntimeStates).values({
+        projectId: input.projectId,
+        iterationId: input.iterationId ?? null,
+        agentId: agent.id,
+        state: input.state,
+        stateVersion: input.stateVersion,
+        activityType: input.activity?.type ?? null,
+        activitySummary: input.activity?.summary ?? null,
+        waitingReason: input.waitingReason ?? null,
+        blockerReferences: input.blockerReferences ?? [],
+        modelProvider: input.modelProvider ?? null,
+        model: input.model ?? null,
+        workflowRunId: input.workflowRunId ?? null,
+        correlationId: input.correlationId ?? null,
+        operationKey: input.operationKey,
+        enteredAt,
+      }).returning();
+      return created;
+    });
+    return this.toAgentRuntimeSnapshot(input.role, row);
+  }
+
+  async listAgentRuntimeSnapshots(projectId: string): Promise<AgentRuntimeSnapshot[]> {
+    const rows = await this.database.select({
+      role: schema.agents.role,
+      state: schema.agentRuntimeStates,
+    }).from(schema.agentRuntimeStates)
+      .innerJoin(schema.agents, eq(schema.agentRuntimeStates.agentId, schema.agents.id))
+      .where(and(
+        eq(schema.agentRuntimeStates.projectId, projectId),
+        isNull(schema.agentRuntimeStates.exitedAt),
+      ));
+    return rows.map((row) => this.toAgentRuntimeSnapshot(row.role, row.state));
+  }
+
+  async recordAgentOrderLedger(
+    projectId: string,
+    iterationId: string,
+    role: AgentRole,
+    order: AgentOrder,
+    correlationId: string,
+    sourceRevision?: string,
+  ): Promise<void> {
+    const agent = await this.ensureAgent(projectId, role);
+    const priority = order.priority.toLowerCase() as 'low' | 'normal' | 'high' | 'critical';
+    const goalOperationKey = `${order.orderId}:goal`;
+    await this.database.transaction(async (transaction) => {
+      await transaction.insert(schema.agentGoals).values({
+        projectId,
+        iterationId,
+        agentId: agent.id,
+        objective: order.objective,
+        status: 'active',
+        priority,
+        successCriteria: order.acceptanceCriteria.map((criterion) => criterion.description),
+        correlationId,
+        operationKey: goalOperationKey,
+      }).onConflictDoNothing({
+        target: [schema.agentGoals.projectId, schema.agentGoals.operationKey],
+      });
+      const [goal] = await transaction.select().from(schema.agentGoals).where(and(
+        eq(schema.agentGoals.projectId, projectId),
+        eq(schema.agentGoals.operationKey, goalOperationKey),
+      )).limit(1);
+      if (!goal) throw new Error(`Goal ledger record ${goalOperationKey} could not be loaded.`);
+
+      const supersededAt = new Date();
+      await transaction.update(schema.agentGoals).set({
+        status: 'superseded',
+        updatedAt: supersededAt,
+        completedAt: supersededAt,
+      }).where(and(
+        eq(schema.agentGoals.projectId, projectId),
+        eq(schema.agentGoals.iterationId, iterationId),
+        eq(schema.agentGoals.agentId, agent.id),
+        inArray(schema.agentGoals.status, ['active', 'blocked']),
+        ne(schema.agentGoals.id, goal.id),
+      ));
+      await transaction.update(schema.agentActionPlans).set({
+        status: 'superseded',
+        updatedAt: supersededAt,
+        completedAt: supersededAt,
+      }).where(and(
+        eq(schema.agentActionPlans.projectId, projectId),
+        eq(schema.agentActionPlans.iterationId, iterationId),
+        eq(schema.agentActionPlans.agentId, agent.id),
+        inArray(schema.agentActionPlans.status, ['draft', 'active', 'blocked']),
+        ne(schema.agentActionPlans.goalId, goal.id),
+      ));
+      await transaction.update(schema.agentObligations).set({
+        status: 'deferred',
+        blocking: false,
+        disposition: `Superseded by order ${order.orderId}.`,
+        updatedAt: supersededAt,
+      }).where(and(
+        eq(schema.agentObligations.projectId, projectId),
+        eq(schema.agentObligations.iterationId, iterationId),
+        eq(schema.agentObligations.ownerAgentId, agent.id),
+        inArray(schema.agentObligations.status, ['pending', 'ready', 'in_progress', 'blocked', 'failed']),
+        ne(schema.agentObligations.goalId, goal.id),
+      ));
+
+      await transaction.insert(schema.agentActionPlans).values({
+        projectId,
+        iterationId,
+        agentId: agent.id,
+        goalId: goal.id,
+        version: 1,
+        summary: order.objective,
+        rationale: order.rationale ?? null,
+        status: 'active',
+        sourceRevision: sourceRevision ?? null,
+        correlationId,
+        operationKey: `${order.orderId}:plan:accepted-order`,
+      }).onConflictDoNothing({
+        target: [schema.agentActionPlans.projectId, schema.agentActionPlans.operationKey],
+      });
+
+      const obligations = [
+        ...order.expectedOutputs.filter((output) => output.required).map((output, index) => ({
+          operationKey: `${order.orderId}:obligation:output:${index}`,
+          type: 'required_output',
+          title: `Produce ${output.artifactType}`,
+          description: output.description,
+          mandatory: true,
+          subjectReferences: [output.artifactType],
+          dependencyReferences: [] as string[],
+        })),
+        ...order.requiredEvidence.filter((evidence) => evidence.required).map((evidence, index) => ({
+          operationKey: `${order.orderId}:obligation:evidence:${index}`,
+          type: 'required_evidence',
+          title: `Provide ${evidence.evidenceType}`,
+          description: evidence.description,
+          mandatory: true,
+          subjectReferences: evidence.subjectRefs,
+          dependencyReferences: [] as string[],
+        })),
+        ...order.acceptanceCriteria.filter((criterion) => criterion.mandatory).map((criterion, index) => ({
+          operationKey: `${order.orderId}:obligation:criterion:${index}`,
+          type: 'acceptance_criterion',
+          title: criterion.criterionId,
+          description: criterion.description,
+          mandatory: true,
+          subjectReferences: criterion.requirementRefs,
+          dependencyReferences: order.dependencies.filter((dependency) => dependency.required).map((dependency) => dependency.refId),
+        })),
+      ];
+      if (obligations.length > 0) {
+        await transaction.insert(schema.agentObligations).values(obligations.map((obligation) => ({
+          projectId,
+          iterationId,
+          ownerAgentId: agent.id,
+          goalId: goal.id,
+          type: obligation.type,
+          title: obligation.title,
+          description: obligation.description,
+          status: 'in_progress' as const,
+          priority,
+          mandatory: obligation.mandatory,
+          blocking: obligation.mandatory,
+          subjectReferences: obligation.subjectReferences,
+          dependencyReferences: obligation.dependencyReferences,
+          sourceRevision: sourceRevision ?? null,
+          correlationId,
+          operationKey: obligation.operationKey,
+        }))).onConflictDoNothing({
+          target: [schema.agentObligations.projectId, schema.agentObligations.operationKey],
+        });
+      }
+    });
+  }
+
+  async recordAgentExecutionLedger(
+    projectId: string,
+    iterationId: string,
+    role: AgentRole,
+    order: AgentOrder,
+    status: 'completed' | 'waiting_for_human' | 'blocked' | 'budget_exhausted',
+    trace: DynamicExecutionTrace | undefined,
+    artifactIds: string[],
+    correlationId: string,
+    sourceRevision?: string,
+    failureReason?: string,
+  ): Promise<void> {
+    await this.recordAgentOrderLedger(projectId, iterationId, role, order, correlationId, sourceRevision);
+    const agent = await this.ensureAgent(projectId, role);
+    const findingOwnerIds = new Map<AgentRole, string>([[role, agent.id]]);
+    for (const ownerRole of new Set((trace?.findings ?? []).map((finding) => finding.ownerRole))) {
+      if (findingOwnerIds.has(ownerRole)) continue;
+      findingOwnerIds.set(ownerRole, (await this.ensureAgent(projectId, ownerRole)).id);
+    }
+    const now = new Date();
+    const goalStatus = status === 'completed' ? 'satisfied' : status === 'waiting_for_human' ? 'active' : 'blocked';
+    const planStatus = status === 'completed' ? 'completed' : status === 'waiting_for_human' ? 'active' : 'blocked';
+    const obligationStatus = status === 'completed' ? 'satisfied' : status === 'waiting_for_human' ? 'in_progress' : 'blocked';
+    await this.database.transaction(async (transaction) => {
+      const [goal] = await transaction.select().from(schema.agentGoals).where(and(
+        eq(schema.agentGoals.projectId, projectId),
+        eq(schema.agentGoals.operationKey, `${order.orderId}:goal`),
+      )).limit(1);
+      if (!goal) throw new Error(`Goal ledger record for ${order.orderId} was not found.`);
+      if (status === 'completed') {
+        await transaction.update(schema.findings).set({
+          status: 'resolved',
+          disposition: 'remediate_current',
+          updatedAt: now,
+          resolvedAt: now,
+        }).where(and(
+          eq(schema.findings.projectId, projectId),
+          eq(schema.findings.iterationId, iterationId),
+          eq(schema.findings.ownerAgentId, agent.id),
+          eq(schema.findings.correlationId, correlationId),
+          inArray(schema.findings.category, ['execution_failure', 'plan_validation']),
+          inArray(schema.findings.status, ['open', 'acknowledged', 'remediating']),
+        ));
+      }
+      await transaction.update(schema.agentGoals).set({
+        status: goalStatus,
+        updatedAt: now,
+        completedAt: status === 'completed' ? now : null,
+      }).where(eq(schema.agentGoals.id, goal.id));
+      await transaction.update(schema.agentActionPlans).set({
+        status: planStatus,
+        updatedAt: now,
+        completedAt: status === 'completed' ? now : null,
+      }).where(and(
+        eq(schema.agentActionPlans.projectId, projectId),
+        eq(schema.agentActionPlans.operationKey, `${order.orderId}:plan:accepted-order`),
+      ));
+      await transaction.update(schema.agentObligations).set({
+        status: obligationStatus,
+        satisfactionEvidence: status === 'completed' ? artifactIds : [],
+        sourceRevision: sourceRevision ?? null,
+        disposition: status === 'budget_exhausted' ? 'Execution budget exhausted.'
+          : status === 'blocked' ? failureReason ?? trace?.terminalReason ?? 'The role order is blocked.'
+            : status === 'waiting_for_human' ? 'Waiting for a recorded human decision.' : null,
+        updatedAt: now,
+        satisfiedAt: status === 'completed' ? now : null,
+      }).where(and(
+        eq(schema.agentObligations.projectId, projectId),
+        eq(schema.agentObligations.goalId, goal.id),
+      ));
+
+      const executionIdentity = trace?.executionId ?? `${correlationId}:${status}`;
+      const executionKey = createHash('sha256').update(executionIdentity).digest('hex').slice(0, 24);
+      const [{ value: highestPlanVersion }] = await transaction.select({
+        value: max(schema.agentActionPlans.version),
+      }).from(schema.agentActionPlans).where(eq(schema.agentActionPlans.goalId, goal.id));
+      let nextPlanVersion = (highestPlanVersion ?? 0) + 1;
+      const actionLedgerIds = new Map<string, string>();
+
+      for (const tracePlan of trace?.plans ?? []) {
+        const planOperationKey = `${order.orderId}:execution:${executionKey}:trace-plan:${tracePlan.round}:${tracePlan.repairAttempt}`;
+        const [existingPlan] = await transaction.select().from(schema.agentActionPlans).where(and(
+          eq(schema.agentActionPlans.projectId, projectId),
+          eq(schema.agentActionPlans.operationKey, planOperationKey),
+        )).limit(1);
+        const desiredPlanStatus = tracePlan.accepted ? planStatus : 'superseded';
+        const [plan] = existingPlan
+          ? await transaction.update(schema.agentActionPlans).set({
+            status: desiredPlanStatus,
+            sourceRevision: sourceRevision ?? null,
+            correlationId,
+            updatedAt: now,
+            completedAt: tracePlan.accepted && status === 'completed' ? now : null,
+          }).where(eq(schema.agentActionPlans.id, existingPlan.id)).returning()
+          : await transaction.insert(schema.agentActionPlans).values({
+            projectId,
+            iterationId,
+            agentId: agent.id,
+            goalId: goal.id,
+            version: nextPlanVersion++,
+            summary: tracePlan.goalAssessment || `Execution plan round ${tracePlan.round}`,
+            rationale: tracePlan.validationIssues.length > 0 ? tracePlan.validationIssues.join('\n') : null,
+            status: desiredPlanStatus,
+            sourceRevision: sourceRevision ?? null,
+            correlationId,
+            operationKey: planOperationKey,
+            createdAt: now,
+            updatedAt: now,
+            completedAt: tracePlan.accepted && status === 'completed' ? now : null,
+          }).returning();
+        if (!plan) throw new Error(`Action plan ledger record ${planOperationKey} could not be loaded.`);
+
+        for (const [actionIndex, action] of tracePlan.actions.entries()) {
+          const observation = trace?.observations.find((candidate) =>
+            candidate.round === tracePlan.round && candidate.actionId === action.id);
+          const actionStatus: (typeof schema.agentActionStatuses)[number] = observation?.status === 'succeeded' ? 'completed'
+            : observation?.status === 'failed' ? 'failed'
+              : observation?.status === 'skipped' ? 'cancelled'
+                : tracePlan.accepted ? 'pending' : 'superseded';
+          const actionOperationKey = `${planOperationKey}:action:${action.id}`;
+          const actionValues = {
+            projectId,
+            iterationId,
+            agentId: agent.id,
+            planId: plan.id,
+            position: actionIndex,
+            kind: `${action.activity}@${action.activityVersion}`,
+            summary: action.reason,
+            status: actionStatus,
+            blocking: actionStatus === 'failed',
+            dependencyActionIds: action.dependsOn,
+            input: { activity: action.activity, activityVersion: action.activityVersion },
+            output: observation?.result ?? null,
+            error: observation?.error?.message ?? null,
+            correlationId,
+            operationKey: actionOperationKey,
+            updatedAt: now,
+            startedAt: observation ? now : null,
+            completedAt: observation ? now : null,
+          } satisfies typeof schema.agentActions.$inferInsert;
+          const [existingActionAtPosition] = await transaction.select().from(schema.agentActions).where(and(
+            eq(schema.agentActions.planId, plan.id),
+            eq(schema.agentActions.position, actionIndex),
+          )).limit(1);
+          const [actionRow] = existingActionAtPosition
+            ? await transaction.update(schema.agentActions).set({
+              kind: actionValues.kind,
+              summary: actionValues.summary,
+              status: actionValues.status,
+              blocking: actionValues.blocking,
+              dependencyActionIds: actionValues.dependencyActionIds,
+              input: actionValues.input,
+              output: actionValues.output,
+              error: actionValues.error,
+              correlationId: actionValues.correlationId,
+              operationKey: actionValues.operationKey,
+              updatedAt: now,
+              startedAt: actionValues.startedAt,
+              completedAt: actionValues.completedAt,
+            }).where(eq(schema.agentActions.id, existingActionAtPosition.id)).returning()
+            : await transaction.insert(schema.agentActions).values({
+              ...actionValues,
+              createdAt: now,
+            }).returning();
+          if (actionRow) actionLedgerIds.set(action.id, actionRow.id);
+          if (observation?.status === 'failed') {
+            const findingStatus: (typeof schema.findingStatuses)[number] = status === 'completed' ? 'resolved' : 'open';
+            const findingValues = {
+              projectId,
+              iterationId,
+              raisedByAgentId: agent.id,
+              ownerAgentId: agent.id,
+              actionId: actionRow?.id ?? null,
+              category: 'execution_failure',
+              title: `${action.activity} failed`,
+              description: observation.error?.message ?? observation.summary,
+              severity: 'high' as const,
+              status: findingStatus,
+              disposition: 'remediate_current' as const,
+              subjectReferences: [action.activity],
+              evidenceReferences: [observation.operationKey],
+              sourceRevision: sourceRevision ?? null,
+              correlationId,
+              operationKey: `${actionOperationKey}:finding`,
+              createdAt: now,
+              updatedAt: now,
+              resolvedAt: status === 'completed' ? now : null,
+            } satisfies typeof schema.findings.$inferInsert;
+            await transaction.insert(schema.findings).values(findingValues).onConflictDoUpdate({
+              target: [schema.findings.projectId, schema.findings.operationKey],
+              set: {
+                status: findingValues.status,
+                disposition: findingValues.disposition,
+                sourceRevision: findingValues.sourceRevision,
+                correlationId: findingValues.correlationId,
+                updatedAt: now,
+                resolvedAt: findingValues.resolvedAt,
+              },
+            });
+          }
+        }
+
+        for (const [issueIndex, issue] of tracePlan.validationIssues.entries()) {
+          const validationFindingStatus: (typeof schema.findingStatuses)[number] = tracePlan.accepted || status === 'completed'
+            ? 'resolved'
+            : 'open';
+          const validationFindingValues = {
+            projectId,
+            iterationId,
+            raisedByAgentId: agent.id,
+            ownerAgentId: agent.id,
+            category: 'plan_validation',
+            title: `Plan validation issue ${issueIndex + 1}`,
+            description: issue,
+            severity: 'medium' as const,
+            status: validationFindingStatus,
+            disposition: 'remediate_current' as const,
+            subjectReferences: [planOperationKey],
+            evidenceReferences: [],
+            sourceRevision: sourceRevision ?? null,
+            correlationId,
+            operationKey: `${planOperationKey}:validation-finding:${issueIndex}`,
+            createdAt: now,
+            updatedAt: now,
+            resolvedAt: tracePlan.accepted || status === 'completed' ? now : null,
+          } satisfies typeof schema.findings.$inferInsert;
+          await transaction.insert(schema.findings).values(validationFindingValues).onConflictDoUpdate({
+            target: [schema.findings.projectId, schema.findings.operationKey],
+            set: {
+              status: validationFindingValues.status,
+              sourceRevision: validationFindingValues.sourceRevision,
+              correlationId: validationFindingValues.correlationId,
+              updatedAt: now,
+              resolvedAt: validationFindingValues.resolvedAt,
+            },
+          });
+        }
+      }
+
+      const traceInvocations = trace?.invocations ?? [];
+      const traceExecutionId = trace?.executionId;
+      if (traceExecutionId && traceInvocations.length) {
+        await transaction.insert(schema.modelInvocations).values(traceInvocations.map((invocation, invocationIndex) => {
+          const inputTokens = Math.trunc(invocation.usage?.promptTokens ?? 0);
+          const outputTokens = Math.trunc(invocation.usage?.completionTokens ?? 0);
+          return {
+            projectId,
+            iterationId,
+            agentId: agent.id,
+            provider: invocation.provider ?? 'ollama',
+            model: invocation.model,
+            purpose: invocation.purpose,
+            status: 'succeeded' as const,
+            externalRequestId: invocation.requestId ?? null,
+            inputTokens,
+            outputTokens,
+            totalTokens: Math.trunc(invocation.usage?.totalTokens ?? inputTokens + outputTokens),
+            costUsd: invocation.usage?.cost ?? 0,
+            requestMetadata: {
+              executionId: traceExecutionId,
+              invocationIndex,
+              round: invocation.round,
+              providerReported: invocation.provider !== undefined,
+              usageReported: invocation.usage !== undefined,
+            },
+            responseMetadata: { dynamicTerminalStatus: status },
+            correlationId,
+            operationKey: dynamicExecutionModelInvocationOperationKey(traceExecutionId, invocationIndex),
+            createdAt: now,
+            startedAt: now,
+            completedAt: now,
+          };
+        })).onConflictDoUpdate({
+          target: [schema.modelInvocations.projectId, schema.modelInvocations.operationKey],
+          set: {
+            responseMetadata: { dynamicTerminalStatus: status },
+            correlationId,
+          },
+        });
+      }
+
+      for (const finding of trace?.findings ?? []) {
+        const resolved = finding.status === 'resolved';
+        const findingValues = {
+          projectId,
+          iterationId,
+          raisedByAgentId: agent.id,
+          ownerAgentId: findingOwnerIds.get(finding.ownerRole) ?? agent.id,
+          actionId: actionLedgerIds.get(finding.raisedByActionId) ?? null,
+          category: finding.category,
+          title: `Quality review finding for candidate ${finding.candidateVersion}`,
+          description: finding.summary,
+          severity: finding.severity,
+          status: finding.status,
+          disposition: finding.disposition,
+          subjectReferences: [`candidate:${finding.candidateVersion}`],
+          evidenceReferences: finding.evidenceRefs,
+          sourceRevision: sourceRevision ?? null,
+          correlationId,
+          operationKey: `${order.orderId}:execution:${executionKey}:domain-finding:${finding.findingId}`,
+          createdAt: now,
+          updatedAt: now,
+          resolvedAt: resolved ? now : null,
+        } satisfies typeof schema.findings.$inferInsert;
+        await transaction.insert(schema.findings).values(findingValues).onConflictDoUpdate({
+          target: [schema.findings.projectId, schema.findings.operationKey],
+          set: {
+            ownerAgentId: findingValues.ownerAgentId,
+            actionId: findingValues.actionId,
+            category: findingValues.category,
+            title: findingValues.title,
+            description: findingValues.description,
+            severity: findingValues.severity,
+            status: findingValues.status,
+            disposition: findingValues.disposition,
+            subjectReferences: findingValues.subjectReferences,
+            evidenceReferences: findingValues.evidenceReferences,
+            sourceRevision: findingValues.sourceRevision,
+            correlationId: findingValues.correlationId,
+            updatedAt: now,
+            resolvedAt: findingValues.resolvedAt,
+          },
+        });
+      }
+    });
+  }
+
+  async recordAgentMessage(message: AgentMessage): Promise<AgentInteraction> {
+    const [existing] = await this.database.select().from(schema.agentMessages).where(and(
+      eq(schema.agentMessages.projectId, message.projectId),
+      eq(schema.agentMessages.idempotencyKey, message.idempotencyKey),
+    )).limit(1);
+    if (existing) return this.toAgentInteraction(existing, messagePayloadIterationNumber(message.payload) ?? 1);
+
+    const payload = safeMessagePayload(message.payload);
+    const senderRole: AgentRole | 'human' = payload.authoredBy === 'human' ? 'human' : message.sender.role;
+    const sender = senderRole === 'human' ? undefined : await this.ensureAgent(message.projectId, senderRole);
+    const now = new Date(message.createdAt);
+    if (Number.isNaN(now.getTime())) throw new Error('Agent message createdAt must be a valid timestamp.');
+    const recipientRoles = [...new Set(message.recipients.map((recipient) => recipient.role))];
+    const summary = messagePayloadSummary(message.payload) ?? message.name;
+    const messageType = protocolMessageType(message);
+    const row = await this.database.transaction(async (transaction) => {
+      const [causation] = message.causationId
+        ? await transaction.select().from(schema.agentMessages).where(and(
+          eq(schema.agentMessages.projectId, message.projectId),
+          eq(schema.agentMessages.protocolMessageId, message.causationId),
+        )).limit(1)
+        : [];
+      if (message.causationId && !causation) {
+        throw new Error(`Message ${message.messageId} references unknown causation ${message.causationId}.`);
+      }
+      const responseDepth = causation ? causation.responseDepth + 1 : 0;
+      if (messageType === 'finding') {
+        const cooldownKey = `${message.projectId}:${message.correlationId}:${senderRole}:${message.name}:${summary}`;
+        await transaction.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${cooldownKey}))`);
+        const [recentDuplicate] = await transaction.select({ createdAt: schema.agentMessages.createdAt })
+          .from(schema.agentMessages)
+          .where(and(
+            eq(schema.agentMessages.projectId, message.projectId),
+            eq(schema.agentMessages.correlationId, message.correlationId),
+            eq(schema.agentMessages.senderRole, senderRole),
+            eq(schema.agentMessages.type, 'finding'),
+            eq(schema.agentMessages.name, message.name),
+            eq(schema.agentMessages.summary, summary),
+          ))
+          .orderBy(desc(schema.agentMessages.createdAt))
+          .limit(1);
+        const elapsedSinceDuplicate = recentDuplicate
+          ? now.getTime() - recentDuplicate.createdAt.getTime()
+          : undefined;
+        if (elapsedSinceDuplicate !== undefined
+          && elapsedSinceDuplicate >= 0
+          && elapsedSinceDuplicate < FINDING_REPEAT_COOLDOWN_MS) {
+          throw new Error(`Finding ${message.name} is inside the ${FINDING_REPEAT_COOLDOWN_MS / 1_000}-second repeat cooldown.`);
+        }
+      }
+      const [thread] = await transaction.insert(schema.messageThreads).values({
+        projectId: message.projectId,
+        iterationId: message.iterationId ?? null,
+        correlationId: message.correlationId,
+        topic: message.name,
+        status: 'open',
+        responseCount: 1,
+        createdAt: now,
+        updatedAt: now,
+        lastMessageAt: now,
+      }).onConflictDoUpdate({
+        target: [schema.messageThreads.projectId, schema.messageThreads.correlationId],
+        set: {
+          updatedAt: now,
+          lastMessageAt: now,
+          status: 'open',
+          responseCount: sql`${schema.messageThreads.responseCount} + 1`,
+        },
+      }).returning();
+      if (responseDepth > thread.maxResponseDepth) {
+        throw new Error(`Message ${message.messageId} exceeds topic response depth ${thread.maxResponseDepth}.`);
+      }
+      if (thread.responseCount > thread.maxResponseDepth * 8) {
+        throw new Error(`Topic ${message.correlationId} exhausted its ${thread.maxResponseDepth * 8}-message response budget.`);
+      }
+      const [created] = await transaction.insert(schema.agentMessages).values({
+        protocolMessageId: message.messageId,
+        projectId: message.projectId,
+        iterationId: message.iterationId ?? null,
+        threadId: thread.id,
+        senderAgentId: sender?.id ?? null,
+        senderRole,
+        recipientRoles,
+        type: messageType,
+        name: message.name,
+        summary,
+        status: 'pending',
+        priority: message.priority.toLowerCase() as 'low' | 'normal' | 'high' | 'critical',
+        correlationId: message.correlationId,
+        causationMessageId: causation?.id ?? null,
+        responseDepth,
+        idempotencyKey: message.idempotencyKey,
+        requiresAcknowledgement: message.acknowledgementRequired,
+        deliveryStates: Object.fromEntries(recipientRoles.map((role) => [role, 'pending'])),
+        payload,
+        artifactReferences: message.artifactRefs?.map((artifact) => artifact.artifactId) ?? [],
+        createdAt: now,
+        availableAt: now,
+        deliveredAt: null,
+      }).returning();
+      return created;
+    });
+    return this.toAgentInteraction(row, messagePayloadIterationNumber(message.payload) ?? 1);
+  }
+
+  async listAgentMessages(projectId: string): Promise<AgentInteraction[]> {
+    const [messages, iterations] = await Promise.all([
+      this.database.select().from(schema.agentMessages)
+        .where(eq(schema.agentMessages.projectId, projectId))
+        .orderBy(desc(schema.agentMessages.createdAt)),
+      this.database.select().from(schema.iterations).where(eq(schema.iterations.projectId, projectId)),
+    ]);
+    const iterationById = new Map(iterations.map((iteration) => [iteration.id, iteration.number]));
+    return messages.map((message) => this.toAgentInteraction(
+      message,
+      message.iterationId ? iterationById.get(message.iterationId) ?? 1 : 1,
+    ));
+  }
+
+  async transitionAgentMessage(
+    projectId: string,
+    idempotencyKey: string,
+    transition: AgentMessageTransition,
+    recipientRole?: AgentRole | 'human' | 'system',
+  ): Promise<AgentInteraction | undefined> {
+    const row = await this.database.transaction(async (transaction) => {
+      const [existing] = await transaction.select().from(schema.agentMessages).where(and(
+        eq(schema.agentMessages.projectId, projectId),
+        eq(schema.agentMessages.idempotencyKey, idempotencyKey),
+      )).limit(1).for('update');
+      if (!existing) return undefined;
+      if (recipientRole && !existing.recipientRoles.includes(recipientRole)) {
+        throw new Error(`Message ${idempotencyKey} is not addressed to ${recipientRole}.`);
+      }
+
+      const rank: Record<'pending' | AgentMessageTransition, number> = {
+        pending: 0,
+        delivered: 1,
+        acknowledged: 2,
+        completed: 3,
+        failed: 3,
+      };
+      if (existing.status === 'superseded'
+        || existing.status === 'completed'
+        || existing.status === 'failed') return existing;
+
+      const now = new Date();
+      const roles = recipientRole ? [recipientRole] : existing.recipientRoles;
+      const deliveryStates = { ...existing.deliveryStates };
+      let deliveryStateChanged = false;
+      for (const role of roles) {
+        const current = deliveryStates[role];
+        const currentRank = typeof current === 'string' && current in rank
+          ? rank[current as keyof typeof rank]
+          : -1;
+        if (rank[transition] < currentRank || current === 'completed' || current === 'failed') continue;
+        deliveryStates[role] = transition;
+        deliveryStateChanged ||= current !== transition;
+      }
+      const recipientStates = existing.recipientRoles.map((role) => {
+        const state = deliveryStates[role];
+        return typeof state === 'string' && state in rank
+          ? state as 'pending' | AgentMessageTransition
+          : 'pending';
+      });
+      const everyRecipientTerminal = recipientStates.every((state) => state === 'completed' || state === 'failed');
+      const status: Exclude<(typeof schema.agentMessageStatuses)[number], 'superseded'> = everyRecipientTerminal
+        ? recipientStates.some((state) => state === 'failed') ? 'failed' : 'completed'
+        : recipientStates.some((state) => state === 'pending') ? 'pending'
+          : recipientStates.some((state) => state === 'delivered') ? 'delivered'
+            : 'acknowledged';
+      if (!deliveryStateChanged && status === existing.status) return existing;
+      const [updated] = await transaction.update(schema.agentMessages).set({
+        status,
+        deliveryStates,
+        deliveredAt: recipientStates.some((state) => ['delivered', 'acknowledged', 'completed'].includes(state))
+          ? existing.deliveredAt ?? now
+          : existing.deliveredAt,
+        acknowledgedAt: recipientStates.some((state) => state === 'acknowledged' || state === 'completed')
+          ? existing.acknowledgedAt ?? now
+          : existing.acknowledgedAt,
+        completedAt: status === 'completed' || status === 'failed'
+          ? existing.completedAt ?? now
+          : existing.completedAt,
+      }).where(eq(schema.agentMessages.id, existing.id)).returning();
+      return updated;
+    });
+    if (!row) return undefined;
+    const [iteration] = row.iterationId
+      ? await this.database.select({ number: schema.iterations.number }).from(schema.iterations)
+        .where(eq(schema.iterations.id, row.iterationId)).limit(1)
+      : [];
+    return this.toAgentInteraction(row, iteration?.number ?? 1);
+  }
+
+  async recordIterationReviewProposal(input: RecordIterationReviewProposalInput): Promise<IterationReviewProposal> {
+    const manager = await this.ensureAgent(input.projectId, 'manager');
+    const [existing] = await this.database.select().from(schema.iterationReviewProposals).where(and(
+      eq(schema.iterationReviewProposals.projectId, input.projectId),
+      eq(schema.iterationReviewProposals.operationKey, input.operationKey),
+    )).limit(1);
+    if (existing) return this.toIterationReviewProposal(existing, input.iterationNumber);
+    const [{ value: currentVersion }] = await this.database.select({ value: max(schema.iterationReviewProposals.proposalVersion) })
+      .from(schema.iterationReviewProposals)
+      .where(eq(schema.iterationReviewProposals.iterationId, input.iterationId));
+    const now = new Date();
+    await this.database.update(schema.iterationReviewProposals).set({
+      status: 'superseded',
+      resolvedAt: now,
+      updatedAt: now,
+    }).where(and(
+      eq(schema.iterationReviewProposals.iterationId, input.iterationId),
+      inArray(schema.iterationReviewProposals.status, ['draft', 'proposed', 'gate_blocked']),
+    ));
+    const [row] = await this.database.insert(schema.iterationReviewProposals).values({
+      projectId: input.projectId,
+      iterationId: input.iterationId,
+      proposedByAgentId: manager.id,
+      proposalVersion: (currentVersion ?? 0) + 1,
+      status: input.recommendation === 'send_for_human_review' ? 'proposed' : 'draft',
+      objectiveStatus: input.objectiveStatus,
+      includedRevision: input.includedRevision,
+      completedOutcomes: input.completedOutcomes,
+      openFindings: input.openFindings,
+      agentPositions: input.agentPositions,
+      gateStatus: input.gateStatus === 'blocked' ? 'block' : 'pass',
+      gateRationale: input.gateRationale,
+      managerRationale: input.managerRationale,
+      recommendation: input.recommendation,
+      knownLimitations: input.knownLimitations,
+      budgetSnapshot: input.budgetSnapshot,
+      correlationId: input.correlationId,
+      operationKey: input.operationKey,
+      createdAt: now,
+      updatedAt: now,
+    }).returning();
+    return this.toIterationReviewProposal(row, input.iterationNumber);
+  }
+
+  async supersedeIterationReviewProposal(projectId: string, iterationNumber: number): Promise<boolean> {
+    const [iteration] = await this.database.select({ id: schema.iterations.id }).from(schema.iterations)
+      .where(and(
+        eq(schema.iterations.projectId, projectId),
+        eq(schema.iterations.number, iterationNumber),
+      )).limit(1);
+    if (!iteration) return false;
+    const now = new Date();
+    await this.database.update(schema.iterationReviewProposals).set({
+      status: 'superseded',
+      resolvedAt: now,
+      updatedAt: now,
+    }).where(and(
+      eq(schema.iterationReviewProposals.projectId, projectId),
+      eq(schema.iterationReviewProposals.iterationId, iteration.id),
+      inArray(schema.iterationReviewProposals.status, ['draft', 'proposed', 'gate_blocked']),
+    ));
+    // Replays after the first update remain successful for an existing
+    // iteration even when there is no longer an active proposal to mutate.
+    return true;
+  }
+
+  async listIterationReviewProposals(projectId: string): Promise<IterationReviewProposal[]> {
+    const [proposals, iterations] = await Promise.all([
+      this.database.select().from(schema.iterationReviewProposals)
+        .where(eq(schema.iterationReviewProposals.projectId, projectId))
+        .orderBy(desc(schema.iterationReviewProposals.createdAt)),
+      this.database.select().from(schema.iterations).where(eq(schema.iterations.projectId, projectId)),
+    ]);
+    const iterationById = new Map(iterations.map((iteration) => [iteration.id, iteration.number]));
+    return proposals.map((proposal) => this.toIterationReviewProposal(
+      proposal,
+      iterationById.get(proposal.iterationId) ?? 1,
+    ));
   }
 
   async iteration(projectId: string, number: number): Promise<ProjectIteration> {
@@ -283,7 +1487,7 @@ export class ProjectStore {
         repositoryName: repository.name,
         updatedAt: new Date(),
       }).where(eq(schema.projects.id, projectId)).returning();
-      await transaction.insert(schema.repositoryLifecycleRecords).values({
+      const [lifecycle] = await transaction.insert(schema.repositoryLifecycleRecords).values({
         projectId,
         kind: 'repository_connected',
         status: 'completed',
@@ -291,6 +1495,28 @@ export class ProjectStore {
         externalId: `${repository.owner}/${repository.name}`,
         summary: `Connected repository ${repository.owner}/${repository.name}.`,
         metadata: { owner: repository.owner, name: repository.name },
+        operationKey: `v1:repository:${projectId}:connected:${repository.owner}/${repository.name}`,
+      }).onConflictDoUpdate({
+        target: [schema.repositoryLifecycleRecords.projectId, schema.repositoryLifecycleRecords.operationKey],
+        set: {
+          status: 'completed',
+          repositoryUrl: repository.url,
+          externalId: `${repository.owner}/${repository.name}`,
+          summary: `Connected repository ${repository.owner}/${repository.name}.`,
+          metadata: { owner: repository.owner, name: repository.name },
+        },
+      }).returning();
+      const repositoryOperation = repositoryOperationValues(lifecycle);
+      await transaction.insert(schema.repositoryOperations).values(repositoryOperation).onConflictDoUpdate({
+        target: [schema.repositoryOperations.projectId, schema.repositoryOperations.operationKey],
+        set: {
+          status: repositoryOperation.status,
+          repositoryUrl: repositoryOperation.repositoryUrl,
+          externalId: repositoryOperation.externalId,
+          summary: repositoryOperation.summary,
+          metadata: repositoryOperation.metadata,
+          completedAt: repositoryOperation.completedAt,
+        },
       });
       return updated;
     });
@@ -303,46 +1529,81 @@ export class ProjectStore {
     pullRequestNumber?: number;
     pullRequestUrl?: string;
   }): Promise<ProjectIteration> {
-    const [row] = await this.database.update(schema.iterations).set(delivery)
-      .where(eq(schema.iterations.id, iterationId)).returning();
-    const [project] = await this.database.select().from(schema.projects)
-      .where(eq(schema.projects.id, row.projectId)).limit(1);
-    const records: Array<typeof schema.repositoryLifecycleRecords.$inferInsert> = [];
-    if (delivery.issueNumber !== undefined) {
-      records.push({
-        projectId: row.projectId,
-        iterationId: row.id,
-        kind: 'issue_created',
-        status: 'completed',
-        repositoryUrl: project?.repositoryUrl,
-        externalId: String(delivery.issueNumber),
-        summary: `Repository issue #${delivery.issueNumber} is linked to iteration ${row.number}.`,
-      });
-    }
-    if (delivery.branchName !== undefined) {
-      records.push({
-        projectId: row.projectId,
-        iterationId: row.id,
-        kind: 'branch_created',
-        status: 'completed',
-        repositoryUrl: project?.repositoryUrl,
-        externalId: delivery.branchName,
-        summary: `Branch ${delivery.branchName} is linked to iteration ${row.number}.`,
-      });
-    }
-    if (delivery.pullRequestNumber !== undefined || delivery.pullRequestUrl !== undefined) {
-      records.push({
-        projectId: row.projectId,
-        iterationId: row.id,
-        kind: 'pull_request_opened',
-        status: 'completed',
-        repositoryUrl: project?.repositoryUrl,
-        externalId: delivery.pullRequestNumber === undefined ? delivery.pullRequestUrl : String(delivery.pullRequestNumber),
-        summary: `A pull request is linked to iteration ${row.number}.`,
-        metadata: delivery.pullRequestUrl ? { pullRequestUrl: delivery.pullRequestUrl } : {},
-      });
-    }
-    if (records.length > 0) await this.database.insert(schema.repositoryLifecycleRecords).values(records);
+    const row = await this.database.transaction(async (transaction) => {
+      const [updated] = await transaction.update(schema.iterations).set(delivery)
+        .where(eq(schema.iterations.id, iterationId)).returning();
+      const [project] = await transaction.select().from(schema.projects)
+        .where(eq(schema.projects.id, updated.projectId)).limit(1);
+      const records: Array<typeof schema.repositoryLifecycleRecords.$inferInsert> = [];
+      if (delivery.issueNumber !== undefined) {
+        records.push({
+          projectId: updated.projectId,
+          iterationId: updated.id,
+          kind: 'issue_created',
+          status: 'completed',
+          repositoryUrl: project?.repositoryUrl,
+          externalId: String(delivery.issueNumber),
+          summary: `Repository issue #${delivery.issueNumber} is linked to iteration ${updated.number}.`,
+          operationKey: `v1:delivery:${updated.id}:issue:${delivery.issueNumber}`,
+        });
+      }
+      if (delivery.branchName !== undefined) {
+        records.push({
+          projectId: updated.projectId,
+          iterationId: updated.id,
+          kind: 'branch_created',
+          status: 'completed',
+          repositoryUrl: project?.repositoryUrl,
+          externalId: delivery.branchName,
+          summary: `Branch ${delivery.branchName} is linked to iteration ${updated.number}.`,
+          metadata: { branchName: delivery.branchName },
+          operationKey: `v1:delivery:${updated.id}:branch:${delivery.branchName}`,
+        });
+      }
+      if (delivery.pullRequestNumber !== undefined || delivery.pullRequestUrl !== undefined) {
+        const externalId = delivery.pullRequestNumber === undefined ? delivery.pullRequestUrl : String(delivery.pullRequestNumber);
+        records.push({
+          projectId: updated.projectId,
+          iterationId: updated.id,
+          kind: 'pull_request_opened',
+          status: 'completed',
+          repositoryUrl: project?.repositoryUrl,
+          externalId,
+          summary: `A pull request is linked to iteration ${updated.number}.`,
+          metadata: {
+            ...(delivery.pullRequestUrl ? { pullRequestUrl: delivery.pullRequestUrl } : {}),
+            ...(delivery.branchName ? { branchName: delivery.branchName } : {}),
+          },
+          operationKey: `v1:delivery:${updated.id}:pull-request:${externalId}`,
+        });
+      }
+      for (const record of records) {
+        const [lifecycle] = await transaction.insert(schema.repositoryLifecycleRecords).values(record)
+          .onConflictDoUpdate({
+            target: [schema.repositoryLifecycleRecords.projectId, schema.repositoryLifecycleRecords.operationKey],
+            set: {
+              status: record.status,
+              repositoryUrl: record.repositoryUrl,
+              externalId: record.externalId,
+              summary: record.summary,
+              metadata: record.metadata ?? {},
+            },
+          }).returning();
+        const operation = repositoryOperationValues(lifecycle);
+        await transaction.insert(schema.repositoryOperations).values(operation).onConflictDoUpdate({
+          target: [schema.repositoryOperations.projectId, schema.repositoryOperations.operationKey],
+          set: {
+            status: operation.status,
+            branchName: operation.branchName,
+            externalId: operation.externalId,
+            summary: operation.summary,
+            metadata: operation.metadata,
+            completedAt: operation.completedAt,
+          },
+        });
+      }
+      return updated;
+    });
     return this.toIteration(row);
   }
 
@@ -350,55 +1611,336 @@ export class ProjectStore {
     input: Omit<ProjectEvent, 'id' | 'createdAt'>,
     operationKey?: string,
   ): Promise<ProjectEvent> {
-    if (operationKey) {
-      const [existing] = await this.database.select().from(schema.projectEvents).where(and(
-        eq(schema.projectEvents.projectId, input.projectId),
-        eq(schema.projectEvents.operationKey, operationKey),
-      )).limit(1);
-      if (existing) return this.toEvent(existing);
-    }
-    const [row] = await this.database.insert(schema.projectEvents).values({
+    const assertCompatibleReplay = (row: typeof schema.projectEvents.$inferSelect) => {
+      if (row.projectId !== input.projectId
+        || row.iterationNumber !== input.iterationNumber
+        || row.kind !== input.kind
+        || row.title !== input.title
+        || row.description !== input.description
+        || row.agentRole !== input.agentRole) {
+        throw new Error(`Event operation ${operationKey} was already used with a different payload.`);
+      }
+    };
+    const values = {
       ...input,
       operationKey: operationKey ?? null,
-    }).returning();
-    await this.database.update(schema.projects).set({ updatedAt: new Date() }).where(eq(schema.projects.id, input.projectId));
+    };
+    const [created] = operationKey
+      ? await this.database.insert(schema.projectEvents).values(values).onConflictDoNothing({
+        target: [schema.projectEvents.projectId, schema.projectEvents.operationKey],
+      }).returning()
+      : await this.database.insert(schema.projectEvents).values(values).returning();
+    if (created) {
+      await this.database.update(schema.projects).set({ updatedAt: new Date() }).where(eq(schema.projects.id, input.projectId));
+      return this.toEvent(created);
+    }
+    const [row] = await this.database.select().from(schema.projectEvents).where(and(
+      eq(schema.projectEvents.projectId, input.projectId),
+      eq(schema.projectEvents.operationKey, operationKey!),
+    )).limit(1);
+    if (!row) throw new Error(`Event operation ${operationKey} conflicted but could not be reloaded.`);
+    assertCompatibleReplay(row);
     return this.toEvent(row);
   }
 
-  async addArtifact(projectId: string, iterationId: string, draft: AgentArtifactDraft, iterationNumber: number | null = null): Promise<ProjectArtifact> {
-    const [{ value }] = await this.database.select({ value: max(schema.artifacts.version) }).from(schema.artifacts)
-      .where(and(eq(schema.artifacts.projectId, projectId), eq(schema.artifacts.type, draft.type)));
-    const [row] = await this.database.insert(schema.artifacts).values({
-      projectId,
-      iterationId,
-      type: draft.type,
-      name: draft.name,
-      version: (value ?? 0) + 1,
-      content: draft.content,
-      mimeType: draft.mimeType,
-      producedBy: draft.producedBy,
-      model: draft.model,
-      modelProvider: draft.modelProvider ?? null,
-      modelInvocations: draft.modelInvocations ?? null,
-    }).returning();
-    await this.addEvent({
-      projectId,
-      iterationNumber,
-      kind: 'artifact',
-      title: `${draft.name} is ready`,
-      description: `${draft.producedBy} produced version ${(value ?? 0) + 1} for review.`,
-      agentRole: draft.producedBy,
+  async addArtifact(
+    projectId: string,
+    iterationId: string,
+    draft: AgentArtifactDraft,
+    iterationNumber: number | null = null,
+    operationKey?: string,
+    options?: AddArtifactPersistenceOptions,
+  ): Promise<ProjectArtifact> {
+    const modelInvocationExecutionId = options?.modelInvocationExecutionId ?? draft.executionTrace?.executionId;
+    const row = await this.database.transaction(async (transaction) => {
+      if (operationKey) {
+        const [existing] = await transaction.select().from(schema.artifacts).where(and(
+          eq(schema.artifacts.projectId, projectId),
+          eq(schema.artifacts.operationKey, operationKey),
+        )).limit(1);
+        if (existing) {
+          assertCompatibleArtifactReplay(existing, projectId, iterationId, draft, operationKey, options);
+          return existing;
+        }
+      }
+      const [{ value }] = await transaction.select({ value: max(schema.artifacts.version) }).from(schema.artifacts)
+        .where(and(eq(schema.artifacts.projectId, projectId), eq(schema.artifacts.type, draft.type)));
+      const values = {
+        projectId,
+        iterationId,
+        type: draft.type,
+        name: draft.name,
+        version: (value ?? 0) + 1,
+        content: draft.content,
+        mimeType: draft.mimeType,
+        producedBy: draft.producedBy,
+        model: draft.model,
+        modelProvider: draft.modelProvider ?? null,
+        modelInvocations: draft.modelInvocations ?? null,
+        executionTrace: options?.stageForRepository ? null : draft.executionTrace ?? null,
+        operationKey: operationKey ?? null,
+        operationManifestHash: options?.operationManifestHash ?? null,
+        operationPayload: options?.operationPayload ?? null,
+        storageMode: options?.storage ?? 'repository',
+        status: options?.stageForRepository ? 'draft' as const : 'ready_for_review' as const,
+      };
+      const [created] = operationKey
+        ? await transaction.insert(schema.artifacts).values(values).onConflictDoNothing({
+          target: [schema.artifacts.projectId, schema.artifacts.operationKey],
+        }).returning()
+        : await transaction.insert(schema.artifacts).values(values).returning();
+      if (!created) {
+        const [replayed] = await transaction.select().from(schema.artifacts).where(and(
+          eq(schema.artifacts.projectId, projectId),
+          eq(schema.artifacts.operationKey, operationKey!),
+        )).limit(1);
+        if (!replayed) throw new Error(`Artifact operation ${operationKey} conflicted but could not be reloaded.`);
+        assertCompatibleArtifactReplay(replayed, projectId, iterationId, draft, operationKey!, options);
+        return replayed;
+      }
+      const [producer] = await transaction.select({ id: schema.agents.id }).from(schema.agents).where(and(
+        eq(schema.agents.projectId, projectId),
+        eq(schema.agents.role, draft.producedBy),
+      )).limit(1);
+      await transaction.insert(schema.artifactVersions).values({
+        projectId,
+        iterationId,
+        artifactId: created.id,
+        producedByAgentId: producer?.id ?? null,
+        version: created.version,
+        status: created.status,
+        content: created.content,
+        mimeType: created.mimeType,
+        contentHash: `sha256:${createHash('sha256').update(created.content).digest('hex')}`,
+        sourceRevision: options?.sourceRevision ?? null,
+          metadata: {
+            source: 'project_artifacts',
+            producedBy: draft.producedBy,
+            model: draft.model,
+            modelProvider: draft.modelProvider ?? null,
+            storage: options?.storage ?? 'repository',
+          },
+        operationKey: sourceOperationKey('project_artifacts', created.id),
+        createdAt: created.createdAt,
+      });
+
+      if (draft.modelInvocations?.length) {
+        await transaction.insert(schema.modelInvocations).values(draft.modelInvocations.map((invocation, invocationIndex) => {
+          const provider = invocation.provider ?? draft.modelProvider ?? 'ollama';
+          const inputTokens = Math.trunc(invocation.usage?.promptTokens ?? 0);
+          const outputTokens = Math.trunc(invocation.usage?.completionTokens ?? 0);
+          const fingerprint = createHash('sha256').update(JSON.stringify({
+            provider,
+            model: invocation.model,
+            purpose: invocation.purpose,
+            round: invocation.round,
+            usage: invocation.usage ?? null,
+          })).digest('hex');
+          return {
+            projectId,
+            iterationId,
+            agentId: producer?.id ?? null,
+            provider,
+            model: invocation.model,
+            purpose: invocation.purpose,
+            status: 'succeeded' as const,
+            externalRequestId: invocation.requestId ?? null,
+            inputTokens,
+            outputTokens,
+            totalTokens: Math.trunc(invocation.usage?.totalTokens ?? inputTokens + outputTokens),
+            costUsd: invocation.usage?.cost ?? 0,
+            requestMetadata: {
+              round: invocation.round,
+              artifactId: created.id,
+              artifactVersion: created.version,
+            },
+            responseMetadata: {},
+            correlationId: `artifact:${created.id}`,
+            operationKey: modelInvocationExecutionId
+              ? dynamicExecutionModelInvocationOperationKey(modelInvocationExecutionId, invocationIndex)
+              : options?.modelInvocationOperationPrefix
+                ? `${options.modelInvocationOperationPrefix}:model-invocation:${invocationIndex}`
+              : invocation.requestId
+                ? `v1:model-invocation:${provider}:${invocation.requestId}`
+                : `v1:model-invocation:${provider}:fingerprint:${fingerprint}`,
+            createdAt: created.createdAt,
+            startedAt: created.createdAt,
+            completedAt: created.createdAt,
+          };
+        })).onConflictDoNothing({
+          target: [schema.modelInvocations.projectId, schema.modelInvocations.operationKey],
+        });
+      }
+      return created;
+    });
+    if (!options?.stageForRepository) {
+      await this.addEvent({
+        projectId,
+        iterationNumber,
+        kind: 'artifact',
+        title: `${draft.name} is ready`,
+        description: `${draft.producedBy} produced version ${row.version} for review.`,
+        agentRole: draft.producedBy,
+      }, operationKey ? `${operationKey}:event` : undefined);
+    }
+    return this.toArtifact(row);
+  }
+
+  async loadArtifactOperationDraft(
+    projectId: string,
+    rootArtifactOperationKey: string,
+    expectedEnvelope?: ArtifactOperationRecoveryEnvelope,
+  ): Promise<AgentArtifactDraft | undefined> {
+    const [row] = await this.database.select().from(schema.artifacts).where(and(
+      eq(schema.artifacts.projectId, projectId),
+      eq(schema.artifacts.operationKey, rootArtifactOperationKey),
+    )).limit(1);
+    if (!row) return undefined;
+    if (row.status !== 'draft' && row.status !== 'ready_for_review') return undefined;
+    if (!row.operationPayload || !row.operationManifestHash) {
+      throw new Error(`Artifact operation ${rootArtifactOperationKey} is missing its recovery snapshot.`);
+    }
+    const [version] = await this.database.select({
+      sourceRevision: schema.artifactVersions.sourceRevision,
+    }).from(schema.artifactVersions).where(and(
+      eq(schema.artifactVersions.artifactId, row.id),
+      eq(schema.artifactVersions.version, row.version),
+    )).limit(1);
+    if (!organismAgentRoles.includes(row.producedBy as AgentRole)) {
+      throw new Error(`Artifact operation ${rootArtifactOperationKey} has an invalid producer role.`);
+    }
+    const durableEnvelope: ArtifactOperationRecoveryEnvelope = {
+      iterationId: row.iterationId,
+      type: row.type,
+      producedBy: row.producedBy as AgentRole,
+      storage: row.storageMode,
+      sourceRevision: version?.sourceRevision ?? null,
+    };
+    if (expectedEnvelope && canonicalJson(durableEnvelope) !== canonicalJson(expectedEnvelope)) {
+      throw new Error(`Artifact operation ${rootArtifactOperationKey} does not match its requested recovery envelope.`);
+    }
+    const manifest = expectedEnvelope
+      ? { draft: row.operationPayload, envelope: durableEnvelope }
+      : row.operationPayload;
+    const actualHash = `sha256:${createHash('sha256').update(canonicalJson(manifest)).digest('hex')}`;
+    if (actualHash !== row.operationManifestHash) {
+      throw new Error(`Artifact operation ${rootArtifactOperationKey} has a corrupt recovery snapshot.`);
+    }
+    return row.operationPayload;
+  }
+
+  async rejectArtifacts(
+    projectId: string,
+    artifactIds: readonly string[],
+  ): Promise<void> {
+    const uniqueIds = [...new Set(artifactIds)];
+    if (uniqueIds.length === 0) return;
+    await this.database.transaction(async (transaction) => {
+      const rows = await transaction.select({
+        id: schema.artifacts.id,
+        status: schema.artifacts.status,
+      }).from(schema.artifacts).where(and(
+        eq(schema.artifacts.projectId, projectId),
+        inArray(schema.artifacts.id, uniqueIds),
+      )).for('update');
+      if (rows.length !== uniqueIds.length) {
+        throw new Error('One or more rejected artifacts do not belong to the requested project.');
+      }
+      if (rows.some((row) => row.status === 'approved')) {
+        throw new Error('An approved artifact cannot be rejected by candidate preflight.');
+      }
+      await transaction.update(schema.artifacts).set({
+        // Parent preflight rejected this exact candidate. Superseding it keeps
+        // its audit record while preventing reactive context selection from
+        // treating orphan attachments as still-actionable human feedback.
+        status: 'superseded',
+      }).where(and(
+        eq(schema.artifacts.projectId, projectId),
+        inArray(schema.artifacts.id, uniqueIds),
+        inArray(schema.artifacts.status, ['draft', 'ready_for_review', 'changes_requested']),
+      ));
+      await transaction.update(schema.artifactVersions).set({
+        status: 'superseded',
+      }).where(and(
+        eq(schema.artifactVersions.projectId, projectId),
+        inArray(schema.artifactVersions.artifactId, uniqueIds),
+      ));
+    });
+  }
+
+  async locateArtifact(
+    artifactId: string,
+    repositoryPath: string,
+    repositoryUrl: string,
+    completion?: CompleteArtifactPersistenceOptions,
+  ): Promise<ProjectArtifact> {
+    const row = await this.database.transaction(async (transaction) => {
+      const [located] = await transaction.update(schema.artifacts).set({
+        repositoryPath,
+        repositoryUrl,
+        ...(completion ? {
+          status: 'ready_for_review' as const,
+          executionTrace: completion.executionTrace ?? null,
+        } : {}),
+      })
+        .where(eq(schema.artifacts.id, artifactId)).returning();
+      if (!located) throw new Error(`Artifact ${artifactId} does not exist.`);
+      const [producer] = await transaction.select({ id: schema.agents.id }).from(schema.agents).where(and(
+        eq(schema.agents.projectId, located.projectId),
+        eq(schema.agents.role, located.producedBy as AgentRole),
+      )).limit(1);
+      await transaction.insert(schema.artifactVersions).values({
+        projectId: located.projectId,
+        iterationId: located.iterationId,
+        artifactId: located.id,
+        producedByAgentId: producer?.id ?? null,
+        version: located.version,
+        status: located.status,
+        content: located.content,
+        mimeType: located.mimeType,
+        contentHash: `sha256:${createHash('sha256').update(located.content).digest('hex')}`,
+        storageUri: repositoryUrl,
+        repositoryPath,
+        metadata: {
+          source: 'project_artifacts',
+          producedBy: located.producedBy,
+          model: located.model,
+          modelProvider: located.modelProvider,
+        },
+        operationKey: sourceOperationKey('project_artifacts', located.id),
+        createdAt: located.createdAt,
+      }).onConflictDoUpdate({
+        target: [schema.artifactVersions.artifactId, schema.artifactVersions.version],
+        set: {
+          storageUri: repositoryUrl,
+          repositoryPath,
+          ...(completion ? { status: 'ready_for_review' as const } : {}),
+        },
+      });
+      if (completion) {
+        const event = {
+          projectId: located.projectId,
+          iterationNumber: completion.iterationNumber,
+          kind: 'artifact' as const,
+          title: `${located.name} is ready`,
+          description: `${located.producedBy} produced version ${located.version} for review.`,
+          agentRole: located.producedBy as AgentRole,
+          operationKey: completion.eventOperationKey ?? null,
+        };
+        if (completion.eventOperationKey) {
+          await transaction.insert(schema.projectEvents).values(event).onConflictDoNothing({
+            target: [schema.projectEvents.projectId, schema.projectEvents.operationKey],
+          });
+        } else {
+          await transaction.insert(schema.projectEvents).values(event);
+        }
+      }
+      return located;
     });
     return this.toArtifact(row);
   }
 
-  async locateArtifact(artifactId: string, repositoryPath: string, repositoryUrl: string): Promise<ProjectArtifact> {
-    const [row] = await this.database.update(schema.artifacts).set({ repositoryPath, repositoryUrl })
-      .where(eq(schema.artifacts.id, artifactId)).returning();
-    return this.toArtifact(row);
-  }
-
-  async addMedia(input: AddProjectMediaInput): Promise<ProjectMedia> {
+  async addMedia(input: AddProjectMediaInput, operationKey?: string): Promise<ProjectMedia> {
     const {
       sourceRevision = null,
       imageDigest = null,
@@ -407,19 +1949,74 @@ export class ProjectStore {
     } = input;
     const expiration = expiresAt === null ? null : new Date(expiresAt);
     if (expiration && Number.isNaN(expiration.getTime())) throw new Error('Preview media expiresAt must be a valid timestamp.');
-    const [row] = await this.database.insert(schema.projectMedia).values({
+    const values = {
       ...media,
       sourceRevision,
       imageDigest,
       expiresAt: expiration,
-    }).returning();
+      operationKey: operationKey ?? null,
+    };
+    const [created] = operationKey
+      ? await this.database.insert(schema.projectMedia).values(values).onConflictDoNothing({
+        target: [schema.projectMedia.projectId, schema.projectMedia.operationKey],
+      }).returning()
+      : await this.database.insert(schema.projectMedia).values(values).returning();
+    let row = created;
+    if (!row) {
+      [row] = await this.database.select().from(schema.projectMedia).where(and(
+        eq(schema.projectMedia.projectId, input.projectId),
+        eq(schema.projectMedia.operationKey, operationKey!),
+      )).limit(1);
+      if (!row) throw new Error(`Media operation ${operationKey} conflicted but could not be reloaded.`);
+      if (row.iterationId !== (input.iterationId ?? null)
+        || row.kind !== input.kind
+        || row.sourceRevision !== sourceRevision
+        || row.imageDigest !== imageDigest
+        || (row.expiresAt?.toISOString() ?? null) !== (expiration?.toISOString() ?? null)) {
+        throw new Error(`Media operation ${operationKey} was already used with different evidence.`);
+      }
+    }
     await this.database.update(schema.projects).set({ updatedAt: new Date() }).where(eq(schema.projects.id, input.projectId));
     return this.toMedia(row);
   }
 
-  async addAgentQuestion(input: AgentQuestionInput): Promise<AgentQuestion> {
+  async addAgentQuestion(input: AgentQuestionInput, operationKey?: string): Promise<AgentQuestion> {
+    const assertCompatibleReplay = (question: AgentQuestion) => {
+      const optionsMatch = question.options.length === input.options.length
+        && question.options.every((option, index) => {
+          const expected = input.options[index];
+          return expected !== undefined
+            && option.value === expected.value
+            && option.label === expected.label
+            && (option.description ?? undefined) === expected.description;
+        });
+      if (question.projectId !== input.projectId
+        || question.iterationId !== (input.iterationId ?? null)
+        || question.agentRole !== input.agentRole
+        || question.decisionKey !== canonicalDecisionKey(input)
+        || question.question !== input.question
+        || question.context !== (input.context ?? null)
+        || question.allowCustomAnswer !== input.allowCustomAnswer
+        || question.allowAgentDecide !== input.allowAgentDecide
+        || !optionsMatch) {
+        throw new Error(`Question operation ${operationKey} was already used with a different payload.`);
+      }
+    };
+    if (operationKey) {
+      const [existing] = await this.database.select({ id: schema.agentQuestions.id })
+        .from(schema.agentQuestions).where(and(
+          eq(schema.agentQuestions.projectId, input.projectId),
+          eq(schema.agentQuestions.operationKey, operationKey),
+        )).limit(1);
+      if (existing) {
+        const replayed = await this.findAgentQuestion(existing.id);
+        if (!replayed) throw new Error(`Question operation ${operationKey} could not be reloaded.`);
+        assertCompatibleReplay(replayed);
+        return replayed;
+      }
+    }
     const questionId = await this.database.transaction(async (transaction) => {
-      const [question] = await transaction.insert(schema.agentQuestions).values({
+      const values = {
         projectId: input.projectId,
         iterationId: input.iterationId ?? null,
         agentRole: input.agentRole,
@@ -428,7 +2025,22 @@ export class ProjectStore {
         context: input.context ?? null,
         allowCustomAnswer: input.allowCustomAnswer,
         allowAgentDecide: input.allowAgentDecide,
-      }).returning({ id: schema.agentQuestions.id });
+        operationKey: operationKey ?? null,
+      };
+      const [question] = operationKey
+        ? await transaction.insert(schema.agentQuestions).values(values).onConflictDoNothing({
+          target: [schema.agentQuestions.projectId, schema.agentQuestions.operationKey],
+        }).returning({ id: schema.agentQuestions.id })
+        : await transaction.insert(schema.agentQuestions).values(values).returning({ id: schema.agentQuestions.id });
+      if (!question) {
+        const [replayed] = await transaction.select({ id: schema.agentQuestions.id })
+          .from(schema.agentQuestions).where(and(
+            eq(schema.agentQuestions.projectId, input.projectId),
+            eq(schema.agentQuestions.operationKey, operationKey!),
+          )).limit(1);
+        if (!replayed) throw new Error(`Question operation ${operationKey} conflicted but could not be reloaded.`);
+        return replayed.id;
+      }
       await transaction.insert(schema.agentQuestionOptions).values(input.options.map((option, position) => ({
         questionId: question.id,
         value: option.value,
@@ -440,6 +2052,7 @@ export class ProjectStore {
     });
     const question = await this.findAgentQuestion(questionId);
     if (!question) throw new Error(`Question ${questionId} was not persisted.`);
+    if (operationKey) assertCompatibleReplay(question);
     await this.reuseExistingDecision(question);
     return (await this.findAgentQuestion(questionId)) ?? question;
   }
@@ -499,6 +2112,8 @@ export class ProjectStore {
       if (question.status === 'answered') return;
       if (question.status !== 'pending') throw new Error(`Question ${questionId} is no longer pending.`);
 
+      let selectedOption: string;
+      let answerRow: typeof schema.agentQuestionAnswers.$inferSelect;
       if (input.resolution === 'selected_option') {
         const [option] = await transaction.select().from(schema.agentQuestionOptions)
           .where(and(
@@ -506,28 +2121,57 @@ export class ProjectStore {
             eq(schema.agentQuestionOptions.questionId, questionId),
           )).limit(1);
         if (!option) throw new Error('The selected option does not belong to this question.');
-        await transaction.insert(schema.agentQuestionAnswers).values({
+        [answerRow] = await transaction.insert(schema.agentQuestionAnswers).values({
           questionId,
           resolution: input.resolution,
           optionId: input.optionId,
           answeredBy,
-        });
+        }).returning();
+        selectedOption = option.value;
       } else if (input.resolution === 'custom') {
         if (!question.allowCustomAnswer) throw new Error('This question does not allow a custom answer.');
-        await transaction.insert(schema.agentQuestionAnswers).values({
+        [answerRow] = await transaction.insert(schema.agentQuestionAnswers).values({
           questionId,
           resolution: input.resolution,
           answer: input.answer,
           answeredBy,
-        });
+        }).returning();
+        selectedOption = input.answer;
       } else {
         if (!question.allowAgentDecide) throw new Error('This question does not allow the agent to decide.');
-        await transaction.insert(schema.agentQuestionAnswers).values({
+        [answerRow] = await transaction.insert(schema.agentQuestionAnswers).values({
           questionId,
           resolution: input.resolution,
           answeredBy,
-        });
+        }).returning();
+        selectedOption = 'agent_decides';
       }
+
+      const optionsConsidered = await transaction.select({ value: schema.agentQuestionOptions.value })
+        .from(schema.agentQuestionOptions)
+        .where(eq(schema.agentQuestionOptions.questionId, questionId))
+        .orderBy(schema.agentQuestionOptions.position);
+      await transaction.insert(schema.humanDecisions).values({
+        projectId: question.projectId,
+        iterationId: question.iterationId,
+        questionId: question.id,
+        decisionKey: normalizeDecisionKey(question.decisionKey),
+        decisionType: 'question_answer',
+        selectedOption,
+        rationale: question.context ?? '',
+        decidedBy: answeredBy,
+        status: 'recorded',
+        optionsConsidered: optionsConsidered.map((option) => option.value),
+        appliesTo: [`question:${question.id}`, `decision:${normalizeDecisionKey(question.decisionKey)}`],
+        authority: {
+          source: 'agent_question_answers',
+          resolution: input.resolution,
+          ...(reuse?.sourceQuestionId ? { reusedFromQuestionId: reuse.sourceQuestionId } : {}),
+        },
+        correlationId: `decision:${normalizeDecisionKey(question.decisionKey)}`,
+        operationKey: sourceOperationKey('agent_question_answers', answerRow.id),
+        createdAt: answerRow.createdAt,
+      });
 
       await transaction.update(schema.agentQuestions).set({
         status: 'answered',
@@ -621,14 +2265,40 @@ export class ProjectStore {
         )).limit(1);
       if (!iteration) throw new Error(`Iteration ${input.iterationId} does not belong to project ${input.projectId}.`);
     }
-    const [row] = await this.database.insert(schema.agentComments).values({
-      projectId: input.projectId,
-      iterationId: input.iterationId ?? null,
-      agentRole: input.agentRole,
-      body: input.body,
-      authorType: input.authorType,
-      authorRole: input.authorRole ?? null,
-    }).returning();
+    const row = await this.database.transaction(async (transaction) => {
+      const [created] = await transaction.insert(schema.agentComments).values({
+        projectId: input.projectId,
+        iterationId: input.iterationId ?? null,
+        agentRole: input.agentRole,
+        body: input.body,
+        authorType: input.authorType,
+        authorRole: input.authorRole ?? null,
+      }).returning();
+      if (input.authorType === 'human') {
+        const [agent] = await transaction.select({ id: schema.agents.id }).from(schema.agents).where(and(
+          eq(schema.agents.projectId, input.projectId),
+          eq(schema.agents.role, input.agentRole),
+        )).limit(1);
+        await transaction.insert(schema.humanFeedback).values({
+          projectId: input.projectId,
+          iterationId: input.iterationId ?? null,
+          agentId: agent?.id ?? null,
+          type: 'agent_comment',
+          body: input.body,
+          authorId: 'human',
+          status: 'received',
+          metadata: {
+            source: 'agent_comments',
+            sourceId: created.id,
+            authorType: input.authorType,
+          },
+          correlationId: `agent:${input.agentRole}:feedback`,
+          operationKey: sourceOperationKey('agent_comments', created.id),
+          createdAt: created.createdAt,
+        });
+      }
+      return created;
+    });
     return this.toAgentComment(row);
   }
 
@@ -656,13 +2326,36 @@ export class ProjectStore {
         throw new Error(`Review ${reviewId} does not cover artifact ${input.artifactId}.`);
       }
     }
-    const [row] = await this.database.insert(schema.artifactFeedback).values({
-      projectId: artifact.projectId,
-      iterationId: artifact.iterationId,
-      artifactId: artifact.id,
-      reviewId,
-      feedback: input.feedback,
-    }).returning();
+    const row = await this.database.transaction(async (transaction) => {
+      const [created] = await transaction.insert(schema.artifactFeedback).values({
+        projectId: artifact.projectId,
+        iterationId: artifact.iterationId,
+        artifactId: artifact.id,
+        reviewId,
+        feedback: input.feedback,
+      }).returning();
+      const [version] = await transaction.select({ id: schema.artifactVersions.id }).from(schema.artifactVersions)
+        .where(and(
+          eq(schema.artifactVersions.artifactId, artifact.id),
+          eq(schema.artifactVersions.version, artifact.version),
+        )).limit(1);
+      await transaction.insert(schema.humanFeedback).values({
+        projectId: artifact.projectId,
+        iterationId: artifact.iterationId,
+        reviewId,
+        artifactId: artifact.id,
+        artifactVersionId: version?.id ?? null,
+        type: 'artifact_feedback',
+        body: input.feedback,
+        authorId: 'human',
+        status: 'received',
+        metadata: { source: 'artifact_feedback', sourceId: created.id },
+        correlationId: `artifact:${artifact.id}:feedback`,
+        operationKey: sourceOperationKey('artifact_feedback', created.id),
+        createdAt: created.createdAt,
+      });
+      return created;
+    });
     return this.toArtifactFeedback(row);
   }
 
@@ -684,24 +2377,47 @@ export class ProjectStore {
     input: RepositoryLifecycleInput,
     operationKey?: string,
   ): Promise<RepositoryLifecycleRecord> {
-    if (operationKey) {
-      const [existing] = await this.database.select().from(schema.repositoryLifecycleRecords).where(and(
-        eq(schema.repositoryLifecycleRecords.projectId, input.projectId),
-        eq(schema.repositoryLifecycleRecords.operationKey, operationKey),
-      )).limit(1);
-      if (existing) return this.toRepositoryLifecycle(existing);
-    }
-    const [row] = await this.database.insert(schema.repositoryLifecycleRecords).values({
-      projectId: input.projectId,
-      iterationId: input.iterationId ?? null,
-      kind: input.kind,
-      status: input.status,
-      repositoryUrl: input.repositoryUrl ?? null,
-      externalId: input.externalId ?? null,
-      summary: input.summary,
-      metadata: input.metadata,
-      operationKey: operationKey ?? null,
-    }).returning();
+    const row = await this.database.transaction(async (transaction) => {
+      let lifecycle: typeof schema.repositoryLifecycleRecords.$inferSelect | undefined;
+      if (operationKey) {
+        [lifecycle] = await transaction.select().from(schema.repositoryLifecycleRecords).where(and(
+          eq(schema.repositoryLifecycleRecords.projectId, input.projectId),
+          eq(schema.repositoryLifecycleRecords.operationKey, operationKey),
+        )).limit(1).for('update');
+      }
+      if (!lifecycle) {
+        [lifecycle] = await transaction.insert(schema.repositoryLifecycleRecords).values({
+          projectId: input.projectId,
+          iterationId: input.iterationId ?? null,
+          kind: input.kind,
+          status: input.status,
+          repositoryUrl: input.repositoryUrl ?? null,
+          externalId: input.externalId ?? null,
+          summary: input.summary,
+          metadata: input.metadata,
+          operationKey: operationKey ?? null,
+        }).returning();
+      }
+      const operation = repositoryOperationValues(lifecycle);
+      await transaction.insert(schema.repositoryOperations).values(operation).onConflictDoUpdate({
+        target: [schema.repositoryOperations.projectId, schema.repositoryOperations.operationKey],
+        set: {
+          status: operation.status,
+          mutating: operation.mutating,
+          repositoryUrl: operation.repositoryUrl,
+          branchName: operation.branchName,
+          paths: operation.paths,
+          expectedBaseRevision: operation.expectedBaseRevision,
+          resultingRevision: operation.resultingRevision,
+          externalId: operation.externalId,
+          summary: operation.summary,
+          metadata: operation.metadata,
+          correlationId: operation.correlationId,
+          completedAt: operation.completedAt,
+        },
+      });
+      return lifecycle;
+    });
     return this.toRepositoryLifecycle(row);
   }
 
@@ -750,6 +2466,7 @@ export class ProjectStore {
       }
     }
     const suppliedAgentFeedback = new Map(review.agentFeedback?.map((entry) => [entry.role, entry.feedback]));
+    const overallFeedback = [...new Set([review.feedback.trim(), direction.trim()].filter(Boolean))].join('\n\n');
     const now = new Date();
     await this.database.transaction(async (transaction) => {
       await transaction.update(schema.iterations).set({
@@ -759,7 +2476,27 @@ export class ProjectStore {
       await transaction.update(schema.artifacts).set({
         status: approved ? 'ready_for_review' : 'changes_requested',
         reviewedAt: now,
-      }).where(eq(schema.artifacts.iterationId, iteration.id));
+      }).where(and(
+        eq(schema.artifacts.iterationId, iteration.id),
+        ne(schema.artifacts.status, 'superseded'),
+      ));
+      await transaction.update(schema.artifactVersions).set({
+        status: approved ? 'ready_for_review' : 'changes_requested',
+      }).where(and(
+        eq(schema.artifactVersions.iterationId, iteration.id),
+        ne(schema.artifactVersions.status, 'superseded'),
+      ));
+      if (previewRevision) {
+        await transaction.update(schema.iterationReviewProposals).set({
+          status: approved ? 'accepted' : 'rejected',
+          resolvedAt: now,
+          updatedAt: now,
+        }).where(and(
+          eq(schema.iterationReviewProposals.iterationId, iteration.id),
+          eq(schema.iterationReviewProposals.includedRevision, previewRevision),
+          inArray(schema.iterationReviewProposals.status, ['draft', 'proposed', 'gate_blocked']),
+        ));
+      }
       const [reviewRow] = await transaction.insert(schema.iterationReviews).values({
         projectId,
         iterationId: iteration.id,
@@ -772,13 +2509,79 @@ export class ProjectStore {
         previewTriedAt,
         operationKey: operationKey ?? null,
         createdAt: now,
-      }).returning({ id: schema.iterationReviews.id });
-      await transaction.insert(schema.iterationAgentFeedback).values(organismAgentRoles.map((role) => ({
+      }).returning();
+      const agentFeedbackRows = await transaction.insert(schema.iterationAgentFeedback).values(organismAgentRoles.map((role) => ({
         reviewId: reviewRow.id,
         role,
         feedback: suppliedAgentFeedback.get(role) ?? '',
         createdAt: now,
-      })));
+      }))).returning();
+
+      const reviewCorrelationId = operationKey ?? `iteration:${iteration.id}:review:${reviewRow.id}`;
+      await transaction.insert(schema.humanDecisions).values({
+        projectId,
+        iterationId: iteration.id,
+        reviewId: reviewRow.id,
+        decisionKey: `iteration.${iterationNumber}.review`,
+        decisionType: 'iteration_review',
+        selectedOption: persistedDecision,
+        rationale: direction,
+        decidedBy: 'human',
+        status: 'recorded',
+        optionsConsidered: ['approve', 'request_changes'],
+        appliesTo: [`iteration:${iteration.id}`],
+        authority: { source: 'iteration_reviews' },
+        correlationId: reviewCorrelationId,
+        operationKey: sourceOperationKey('iteration_reviews', reviewRow.id),
+        createdAt: reviewRow.createdAt,
+      });
+      if (overallFeedback) {
+        await transaction.insert(schema.humanFeedback).values({
+          projectId,
+          iterationId: iteration.id,
+          reviewId: reviewRow.id,
+          type: 'iteration_review_feedback',
+          body: overallFeedback,
+          authorId: 'human',
+          status: 'received',
+          metadata: {
+            source: 'iteration_reviews',
+            sourceId: reviewRow.id,
+            decision: persistedDecision,
+          },
+          correlationId: reviewCorrelationId,
+          operationKey: sourceOperationKey('iteration_reviews', reviewRow.id, 'feedback'),
+          createdAt: reviewRow.createdAt,
+        });
+      }
+      const meaningfulAgentFeedback = agentFeedbackRows.filter((feedback) => feedback.feedback.trim());
+      if (meaningfulAgentFeedback.length > 0) {
+        const targetAgents = await transaction.select({ id: schema.agents.id, role: schema.agents.role })
+          .from(schema.agents)
+          .where(and(
+            eq(schema.agents.projectId, projectId),
+            inArray(schema.agents.role, meaningfulAgentFeedback.map((feedback) => feedback.role)),
+          ));
+        const agentByRole = new Map(targetAgents.map((agent) => [agent.role, agent.id]));
+        await transaction.insert(schema.humanFeedback).values(meaningfulAgentFeedback.map((feedback) => ({
+          projectId,
+          iterationId: iteration.id,
+          reviewId: reviewRow.id,
+          agentId: agentByRole.get(feedback.role) ?? null,
+          type: 'iteration_agent_feedback',
+          body: feedback.feedback,
+          authorId: 'human',
+          status: 'received' as const,
+          metadata: {
+            source: 'iteration_agent_feedback',
+            sourceId: feedback.id,
+            role: feedback.role,
+          },
+          correlationId: reviewCorrelationId,
+          operationKey: sourceOperationKey('iteration_agent_feedback', feedback.id),
+          createdAt: feedback.createdAt,
+        })));
+      }
 
       const artifactFeedbackInputs = review.artifactFeedback ?? [];
       if (artifactFeedbackInputs.length > 0) {
@@ -789,17 +2592,43 @@ export class ProjectStore {
             inArray(schema.artifacts.id, artifactIds),
           ));
         const artifactsById = new Map(artifactRows.map((artifact) => [artifact.id, artifact]));
+        const artifactVersionRows = await transaction.select({
+          id: schema.artifactVersions.id,
+          artifactId: schema.artifactVersions.artifactId,
+          version: schema.artifactVersions.version,
+        }).from(schema.artifactVersions).where(inArray(schema.artifactVersions.artifactId, artifactIds));
+        const artifactVersionByKey = new Map(artifactVersionRows.map((version) => [
+          `${version.artifactId}:${version.version}`,
+          version.id,
+        ]));
         for (const feedback of artifactFeedbackInputs) {
           const artifact = artifactsById.get(feedback.artifactId);
           if (!artifact) throw new Error(`Artifact ${feedback.artifactId} does not belong to iteration ${iterationNumber}.`);
-          await transaction.insert(schema.artifactFeedback).values({
+          const [feedbackRow] = await transaction.insert(schema.artifactFeedback).values({
             projectId,
             iterationId: iteration.id,
             artifactId: artifact.id,
             reviewId: reviewRow.id,
             feedback: feedback.feedback,
             createdAt: now,
-          });
+          }).returning();
+          if (feedback.feedback.trim()) {
+            await transaction.insert(schema.humanFeedback).values({
+              projectId,
+              iterationId: iteration.id,
+              reviewId: reviewRow.id,
+              artifactId: artifact.id,
+              artifactVersionId: artifactVersionByKey.get(`${artifact.id}:${artifact.version}`) ?? null,
+              type: 'artifact_feedback',
+              body: feedback.feedback,
+              authorId: 'human',
+              status: 'received',
+              metadata: { source: 'artifact_feedback', sourceId: feedbackRow.id },
+              correlationId: reviewCorrelationId,
+              operationKey: sourceOperationKey('artifact_feedback', feedbackRow.id),
+              createdAt: feedbackRow.createdAt,
+            });
+          }
         }
       }
 
@@ -814,7 +2643,7 @@ export class ProjectStore {
       const [project] = await transaction.select().from(schema.projects)
         .where(eq(schema.projects.id, projectId)).limit(1);
       if (project?.repositoryUrl) {
-        await transaction.insert(schema.repositoryLifecycleRecords).values({
+        const [lifecycle] = await transaction.insert(schema.repositoryLifecycleRecords).values({
           projectId,
           iterationId: iteration.id,
           kind: 'review_recorded',
@@ -825,6 +2654,17 @@ export class ProjectStore {
           metadata: { decision: persistedDecision },
           operationKey: operationKey ? `${operationKey}:review-lifecycle` : null,
           createdAt: now,
+        }).returning();
+        const operation = repositoryOperationValues(lifecycle);
+        await transaction.insert(schema.repositoryOperations).values(operation).onConflictDoUpdate({
+          target: [schema.repositoryOperations.projectId, schema.repositoryOperations.operationKey],
+          set: {
+            status: operation.status,
+            externalId: operation.externalId,
+            summary: operation.summary,
+            metadata: operation.metadata,
+            completedAt: operation.completedAt,
+          },
         });
       }
       await transaction.update(schema.projects).set({ updatedAt: now }).where(eq(schema.projects.id, projectId));
@@ -849,7 +2689,15 @@ export class ProjectStore {
       await transaction.update(schema.artifacts).set({
         status: 'approved',
         reviewedAt: now,
-      }).where(eq(schema.artifacts.iterationId, iteration.id));
+      }).where(and(
+        eq(schema.artifacts.iterationId, iteration.id),
+        ne(schema.artifacts.status, 'superseded'),
+      ));
+      await transaction.update(schema.artifactVersions).set({ status: 'approved' })
+        .where(and(
+          eq(schema.artifactVersions.iterationId, iteration.id),
+          ne(schema.artifactVersions.status, 'superseded'),
+        ));
       await transaction.insert(schema.projectEvents).values({
         projectId,
         iterationNumber,
@@ -923,11 +2771,18 @@ export class ProjectStore {
   }
 
   private toArtifact(row: typeof schema.artifacts.$inferSelect): ProjectArtifact {
+    const {
+      operationKey: _operationKey,
+      operationManifestHash: _operationManifestHash,
+      operationPayload: _operationPayload,
+      ...artifact
+    } = row;
     return {
-      ...row,
+      ...artifact,
       producedBy: row.producedBy as AgentRole,
       mimeType: row.mimeType,
       modelInvocations: row.modelInvocations ?? undefined,
+      executionTrace: row.executionTrace ?? undefined,
       createdAt: row.createdAt.toISOString(),
       reviewedAt: row.reviewedAt?.toISOString() ?? null,
     };
@@ -1030,23 +2885,361 @@ export class ProjectStore {
     };
   }
 
+  private toAgentGoal(
+    row: typeof schema.agentGoals.$inferSelect,
+    role: AgentRole,
+  ): AgentGoalRecord {
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      iterationId: row.iterationId,
+      role,
+      objective: row.objective,
+      status: row.status,
+      priority: row.priority,
+      successCriteria: row.successCriteria,
+      correlationId: row.correlationId,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+      completedAt: row.completedAt?.toISOString() ?? null,
+    };
+  }
+
+  private toAgentActionPlan(
+    row: typeof schema.agentActionPlans.$inferSelect,
+    role: AgentRole,
+  ): AgentActionPlanRecord {
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      iterationId: row.iterationId,
+      role,
+      goalId: row.goalId,
+      version: row.version,
+      summary: row.summary,
+      rationale: row.rationale,
+      status: row.status,
+      sourceRevision: row.sourceRevision,
+      correlationId: row.correlationId,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+      completedAt: row.completedAt?.toISOString() ?? null,
+    };
+  }
+
+  private toAgentAction(
+    row: typeof schema.agentActions.$inferSelect,
+    role: AgentRole,
+  ): AgentActionRecord {
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      iterationId: row.iterationId,
+      role,
+      planId: row.planId,
+      position: row.position,
+      kind: row.kind,
+      summary: row.summary,
+      status: row.status,
+      blocking: row.blocking,
+      dependencyActionIds: row.dependencyActionIds,
+      input: row.input,
+      output: row.output,
+      error: row.error,
+      correlationId: row.correlationId,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+      startedAt: row.startedAt?.toISOString() ?? null,
+      completedAt: row.completedAt?.toISOString() ?? null,
+    };
+  }
+
+  private toAgentObligation(
+    row: typeof schema.agentObligations.$inferSelect,
+    ownerRole: AgentRole,
+  ): AgentObligationRecord {
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      iterationId: row.iterationId,
+      ownerRole,
+      goalId: row.goalId,
+      actionId: row.actionId,
+      type: row.type,
+      title: row.title,
+      description: row.description,
+      status: row.status,
+      priority: row.priority,
+      mandatory: row.mandatory,
+      blocking: row.blocking,
+      subjectReferences: row.subjectReferences,
+      dependencyReferences: row.dependencyReferences,
+      satisfactionEvidence: row.satisfactionEvidence,
+      disposition: row.disposition,
+      sourceRevision: row.sourceRevision,
+      correlationId: row.correlationId,
+      dueAt: row.dueAt?.toISOString() ?? null,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+      satisfiedAt: row.satisfiedAt?.toISOString() ?? null,
+    };
+  }
+
+  private toArtifactVersion(
+    row: typeof schema.artifactVersions.$inferSelect,
+    artifactType: string,
+    artifactName: string,
+    producedByRole: AgentRole | null,
+  ): ArtifactVersionRecord {
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      iterationId: row.iterationId,
+      artifactId: row.artifactId,
+      artifactType,
+      artifactName,
+      producedByRole,
+      version: row.version,
+      status: row.status,
+      content: row.content,
+      mimeType: row.mimeType,
+      contentHash: row.contentHash,
+      storageUri: row.storageUri,
+      repositoryPath: row.repositoryPath,
+      sourceRevision: row.sourceRevision,
+      supersedesVersionId: row.supersedesVersionId,
+      metadata: row.metadata,
+      createdAt: row.createdAt.toISOString(),
+    };
+  }
+
+  private toFinding(
+    row: typeof schema.findings.$inferSelect,
+    raisedByRole: AgentRole | null,
+    ownerRole: AgentRole | null,
+  ): FindingRecord {
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      iterationId: row.iterationId,
+      raisedByRole,
+      ownerRole,
+      obligationId: row.obligationId,
+      actionId: row.actionId,
+      artifactVersionId: row.artifactVersionId,
+      category: row.category,
+      title: row.title,
+      description: row.description,
+      severity: row.severity,
+      status: row.status,
+      disposition: row.disposition,
+      subjectReferences: row.subjectReferences,
+      evidenceReferences: row.evidenceReferences,
+      sourceRevision: row.sourceRevision,
+      correlationId: row.correlationId,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+      resolvedAt: row.resolvedAt?.toISOString() ?? null,
+    };
+  }
+
+  private toModelInvocation(
+    row: typeof schema.modelInvocations.$inferSelect,
+    role: AgentRole | null,
+  ): ModelInvocationRecord {
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      iterationId: row.iterationId,
+      role,
+      actionId: row.actionId,
+      provider: row.provider,
+      model: row.model,
+      purpose: row.purpose,
+      status: row.status,
+      externalRequestId: row.externalRequestId,
+      inputTokens: row.inputTokens,
+      outputTokens: row.outputTokens,
+      cachedTokens: row.cachedTokens,
+      totalTokens: row.totalTokens,
+      costUsd: row.costUsd,
+      requestMetadata: row.requestMetadata,
+      responseMetadata: row.responseMetadata,
+      error: row.error,
+      correlationId: row.correlationId,
+      createdAt: row.createdAt.toISOString(),
+      startedAt: row.startedAt?.toISOString() ?? null,
+      completedAt: row.completedAt?.toISOString() ?? null,
+    };
+  }
+
+  private toRepositoryOperation(
+    row: typeof schema.repositoryOperations.$inferSelect,
+    role: AgentRole | null,
+  ): RepositoryOperationRecord {
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      iterationId: row.iterationId,
+      role,
+      actionId: row.actionId,
+      lifecycleRecordId: row.lifecycleRecordId,
+      type: row.type,
+      status: row.status,
+      mutating: row.mutating,
+      repositoryUrl: row.repositoryUrl,
+      branchName: row.branchName,
+      paths: row.paths,
+      expectedBaseRevision: row.expectedBaseRevision,
+      resultingRevision: row.resultingRevision,
+      externalId: row.externalId,
+      summary: row.summary,
+      metadata: row.metadata,
+      correlationId: row.correlationId,
+      createdAt: row.createdAt.toISOString(),
+      startedAt: row.startedAt?.toISOString() ?? null,
+      completedAt: row.completedAt?.toISOString() ?? null,
+    };
+  }
+
+  private toAgentRuntimeSnapshot(
+    role: AgentRole,
+    row: typeof schema.agentRuntimeStates.$inferSelect,
+  ): AgentRuntimeSnapshot {
+    return {
+      role,
+      state: row.state,
+      activity: row.activityType && row.activitySummary
+        ? { type: row.activityType, summary: row.activitySummary, startedAt: row.enteredAt.toISOString() }
+        : null,
+      stateChangedAt: row.enteredAt.toISOString(),
+      mailboxDepth: 0,
+      activeOrderCount: ['planning', 'working', 'reviewing', 'communicating'].includes(row.state) ? 1 : 0,
+      blockerCount: row.blockerReferences.length + (row.state === 'blocked' && row.blockerReferences.length === 0 ? 1 : 0),
+      pendingQuestionCount: row.state === 'waiting_on_human' ? 1 : 0,
+      graphVersion: 1,
+      stateVersion: row.stateVersion,
+    };
+  }
+
+  private toAgentInteraction(
+    row: typeof schema.agentMessages.$inferSelect,
+    iterationNumber: number,
+  ): AgentInteraction {
+    const status: AgentInteraction['status'] = row.status === 'pending' || row.status === 'delivered'
+      ? 'pending'
+      : row.status === 'acknowledged' ? 'acknowledged'
+        : row.status === 'completed' ? 'completed'
+          : row.status === 'superseded' ? 'rejected' : 'blocked';
+    return {
+      id: row.id,
+      messageId: row.protocolMessageId,
+      correlationId: row.correlationId,
+      iterationNumber,
+      from: row.senderRole,
+      to: row.recipientRoles,
+      kind: row.type as AgentInteractionKind,
+      name: row.name,
+      summary: row.summary,
+      status,
+      createdAt: row.createdAt.toISOString(),
+      priority: row.priority,
+      requiresAcknowledgement: row.requiresAcknowledgement,
+      deliveredAt: row.deliveredAt?.toISOString(),
+      live: row.status === 'pending' || row.status === 'delivered',
+    };
+  }
+
+  private toIterationReviewProposal(
+    row: typeof schema.iterationReviewProposals.$inferSelect,
+    iterationNumber: number,
+  ): IterationReviewProposal {
+    const positions = Object.fromEntries(organismAgentRoles.map((role) => {
+      const value = row.agentPositions[role];
+      const allowed = ['ready', 'ready_with_findings', 'ready_with_accepted_risk', 'not_ready', 'not_required'] as const;
+      return [role, allowed.includes(value as (typeof allowed)[number]) ? value : 'not_required'];
+    })) as IterationReviewProposal['agentPositions'];
+    const findings = row.openFindings.flatMap((finding) => {
+      if (!isRecord(finding)
+        || typeof finding.summary !== 'string'
+        || !['critical', 'high', 'medium', 'low', 'info'].includes(String(finding.severity))
+        || !['resolve_in_iteration', 'accepted_risk', 'defer_to_next_iteration', 'human_decision_required'].includes(String(finding.disposition))) return [];
+      return [{
+        findingId: typeof finding.findingId === 'string' ? finding.findingId : undefined,
+        severity: finding.severity as IterationReviewProposal['openFindings'][number]['severity'],
+        summary: finding.summary,
+        disposition: finding.disposition as IterationReviewProposal['openFindings'][number]['disposition'],
+      }];
+    });
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      iterationId: row.iterationId,
+      iterationNumber,
+      type: 'iteration_review_proposal',
+      proposalVersion: row.proposalVersion,
+      status: row.status,
+      objectiveStatus: row.objectiveStatus,
+      includedRevision: row.includedRevision,
+      completedOutcomes: row.completedOutcomes,
+      openFindings: findings,
+      agentPositions: positions,
+      gateStatus: row.gateStatus === 'pass' ? 'pass' : 'blocked',
+      gateRationale: row.gateRationale ?? 'Gate evidence was recorded at the iteration boundary.',
+      managerRationale: row.managerRationale ?? 'Manager recorded the current Gate position and iteration boundary.',
+      recommendation: row.recommendation,
+      knownLimitations: row.knownLimitations,
+      budgetSnapshot: {
+        modelInvocationCount: numericLedgerValue(row.budgetSnapshot.modelInvocationCount),
+        totalTokens: numericLedgerValue(row.budgetSnapshot.totalTokens),
+        openRouterCostUsd: numericLedgerValue(row.budgetSnapshot.openRouterCostUsd),
+        repositoryOperationCount: numericLedgerValue(row.budgetSnapshot.repositoryOperationCount),
+        activeMutationCount: numericLedgerValue(row.budgetSnapshot.activeMutationCount),
+      },
+      createdAt: row.createdAt.toISOString(),
+    };
+  }
+
   private intentArtifact(brief: ProjectBrief) {
     return `# ${brief.name}\n\n## Desired outcome\n${brief.intent}\n\n## People served\n${brief.audience}\n\n## Success\n${brief.success}\n\n## Constraints\n${brief.constraints.map((item) => `- ${item}`).join('\n') || '- None supplied yet'}`;
   }
 }
 
 export {
+  agentActionPlans,
+  agentActions,
   agentComments,
+  agentGoals,
+  agentMessages,
+  agentObligations,
   agentQuestionAnswers,
   agentQuestionOptions,
   agentQuestions,
+  agentRuntimeStates,
+  agents,
   artifactFeedback,
+  artifactVersions,
   artifacts,
+  findings,
+  humanDecisions,
+  humanFeedback,
   iterationAgentFeedback,
+  iterationReviewProposals,
   iterationReviews,
   iterations,
+  messageThreads,
+  modelInvocations,
   projectEvents,
   projectMedia,
   projects,
   repositoryLifecycleRecords,
+  repositoryOperations,
+  temporalPayloadBlobs,
 } from './schema.js';
+
+export {
+  createTemporalDataConverter,
+  PostgresTemporalPayloadStorageDriver,
+  temporalPayloadShouldBeReferenced,
+  type TemporalPayloadBackend,
+} from './temporal-payload-storage.js';

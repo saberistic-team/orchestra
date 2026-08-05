@@ -18,6 +18,7 @@ import {
   isAllowedPreviewRequestUrl,
   isAllowedPreviewWebSocketUrl,
   iterationEvidenceBranch,
+  previewAdapterInternals,
   probePreviewHealth,
   previewHealthInternals,
 } from './activities.js';
@@ -89,12 +90,9 @@ describe('preview deployment activity', () => {
     vi.stubEnv('PREVIEW_DEPLOY_TOKEN', 'preview-token');
     const result = managedResult();
     const gatewayProbe = vi.spyOn(previewHealthInternals, 'requestGatewayHealth').mockResolvedValue(204);
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify(result), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      }))
-      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const adapter = vi.spyOn(previewAdapterInternals, 'postPreviewDeployment')
+      .mockResolvedValue({ status: 200, text: JSON.stringify(result) });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
     vi.stubGlobal('fetch', fetchMock);
     const input = fixture();
 
@@ -107,14 +105,9 @@ describe('preview deployment activity', () => {
       },
     })).resolves.toEqual(result);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const request = fetchMock.mock.calls[0]![1] as RequestInit;
-    expect(request.headers).toMatchObject({
-      accept: 'application/json',
-      authorization: 'Bearer preview-token',
-      'content-type': 'application/json',
-    });
-    expect(JSON.parse(request.body as string)).toEqual({
+    expect(adapter).toHaveBeenCalledWith(
+      new URL('https://deployer.example.test/previews'),
+      {
       contractVersion: PREVIEW_CONTRACT_VERSION,
       projectId: input.project.id,
       iterationId: input.iteration.id,
@@ -126,9 +119,13 @@ describe('preview deployment activity', () => {
         branch: 'iteration-2-agents',
       },
       runtime: PREVIEW_RUNTIME_CONTRACT,
-    });
-    expect(fetchMock.mock.calls[1]?.[0]?.toString()).toBe(`http://${previewHostname}:8080/health`);
-    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({ method: 'GET', redirect: 'error' });
+      },
+      'preview-token',
+      600_000,
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]?.toString()).toBe(`http://${previewHostname}:8080/health`);
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: 'GET', redirect: 'error' });
     expect(gatewayProbe).toHaveBeenCalledWith(
       new URL('http://preview-gateway:3003/health'),
       `${previewHostname}-${'a'.repeat(12)}.localhost:3003`,
@@ -150,10 +147,8 @@ describe('preview deployment activity', () => {
     vi.stubEnv('PREVIEW_DEPLOY_WEBHOOK_URL', 'https://deployer.example.test/previews');
     vi.stubEnv('PREVIEW_DEPLOY_TOKEN', 'preview-token');
     const { imageDigest: _imageDigest, ...incomplete } = managedResult();
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(incomplete), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    })));
+    vi.spyOn(previewAdapterInternals, 'postPreviewDeployment')
+      .mockResolvedValue({ status: 200, text: JSON.stringify(incomplete) });
 
     await expect(deployIterationPreview(fixture())).rejects.toThrow(/invalid managed evidence.*imageDigest/i);
   });
@@ -161,9 +156,9 @@ describe('preview deployment activity', () => {
   it('rejects a managed deployment that points browser validation at a control-plane host', async () => {
     vi.stubEnv('PREVIEW_DEPLOY_WEBHOOK_URL', 'https://deployer.example.test/previews');
     vi.stubEnv('PREVIEW_DEPLOY_TOKEN', 'preview-token');
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(managedResult({
+    vi.spyOn(previewAdapterInternals, 'postPreviewDeployment').mockResolvedValue({ status: 200, text: JSON.stringify(managedResult({
       internalUrl: 'http://postgres:5432/',
-    })), { status: 200, headers: { 'content-type': 'application/json' } })));
+    })) });
 
     await expect(deployIterationPreview(fixture())).rejects.toThrow(/isolated preview network/i);
   });
@@ -171,9 +166,9 @@ describe('preview deployment activity', () => {
   it('rejects a managed deployment bound to another preview container', async () => {
     vi.stubEnv('PREVIEW_DEPLOY_WEBHOOK_URL', 'https://deployer.example.test/previews');
     vi.stubEnv('PREVIEW_DEPLOY_TOKEN', 'preview-token');
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(managedResult({
+    vi.spyOn(previewAdapterInternals, 'postPreviewDeployment').mockResolvedValue({ status: 200, text: JSON.stringify(managedResult({
       internalUrl: 'http://orchestra-preview-another-project-2-0123456789ab:8080/',
-    })), { status: 200, headers: { 'content-type': 'application/json' } })));
+    })) });
 
     await expect(deployIterationPreview(fixture())).rejects.toThrow(/isolated preview network/i);
   });
@@ -187,7 +182,7 @@ describe('preview deployment activity', () => {
 });
 
 describe('Forgejo preview recording uploads', () => {
-  it('updates an existing recording only on the dedicated evidence branch', async () => {
+  it('reuses an existing immutable recording on the dedicated evidence branch', async () => {
     const calls: Array<{ url: URL; method: string; body?: BodyInit | null }> = [];
     vi.stubGlobal('fetch', vi.fn(async (request: string | URL | Request, init: RequestInit = {}) => {
       const url = new URL(request instanceof Request ? request.url : request.toString());
@@ -208,18 +203,44 @@ describe('Forgejo preview recording uploads', () => {
       input.project,
       input.iteration,
       'artifacts/iteration-02/preview-smoke-flow.webm',
-      Buffer.from('new recording'),
+      Buffer.from('new recording that must not replace committed evidence'),
     );
 
     expect(iterationEvidenceBranch(input.iteration)).toBe('iteration-2-evidence');
-    expect(calls.map((call) => call.method)).toEqual(['GET', 'GET', 'PUT']);
+    expect(calls.map((call) => call.method)).toEqual(['GET', 'GET']);
     expect(calls[1]?.url.searchParams.get('ref')).toBe('iteration-2-evidence');
-    expect(JSON.parse(String(calls[2]?.body))).toMatchObject({
-      branch: 'iteration-2-evidence',
-      sha: 'existing-recording-sha',
-    });
-    expect(JSON.parse(String(calls[2]?.body)).branch).not.toBe(input.iteration.branchName);
     expect(url).toContain('/raw/branch/iteration-2-evidence/');
+  });
+
+  it('accepts a concurrent create only after the immutable recording can be reloaded', async () => {
+    const calls: string[] = [];
+    let contentLookups = 0;
+    vi.stubGlobal('fetch', vi.fn(async (request: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(request instanceof Request ? request.url : request.toString());
+      const method = init.method ?? 'GET';
+      calls.push(`${method} ${url.pathname}`);
+      if (url.pathname.endsWith('/branches/iteration-2-evidence')) return new Response('{}', { status: 200 });
+      if (method === 'GET') {
+        contentLookups += 1;
+        return contentLookups === 1
+          ? new Response(null, { status: 404 })
+          : new Response(JSON.stringify({ sha: 'concurrent-recording-sha' }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+      }
+      return new Response('{}', { status: 409 });
+    }));
+    const input = fixture();
+
+    await expect(forgejoUpload(
+      input.project,
+      input.iteration,
+      'artifacts/iteration-02/preview-smoke-flow.webm',
+      Buffer.from('recording'),
+    )).resolves.toContain('/raw/branch/iteration-2-evidence/');
+
+    expect(calls).toHaveLength(4);
   });
 
   it('creates the evidence branch from the review source before adding a new recording', async () => {
@@ -252,6 +273,24 @@ describe('Forgejo preview recording uploads', () => {
 });
 
 describe('managed preview recording boundary', () => {
+  it('returns previously committed revision evidence without launching a browser', async () => {
+    const input = fixture();
+    vi.stubGlobal('fetch', vi.fn(async (request: string | URL | Request) => {
+      const url = new URL(request instanceof Request ? request.url : request.toString());
+      if (url.pathname.endsWith('/branches/iteration-2-evidence')) return new Response('{}', { status: 200 });
+      return new Response(JSON.stringify({ sha: 'already-recorded-sha' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }));
+
+    await expect(captureUserFlow({ ...input, preview: managedResult() })).resolves.toMatchObject({
+      revision,
+      url: expect.stringContaining(`preview-smoke-flow-${revision.slice(0, 12)}.webm`),
+    });
+    expect(chromiumLaunchMock).not.toHaveBeenCalled();
+  });
+
   it('allows only the exact managed origin plus data and blob URLs', () => {
     expect(isAllowedPreviewRequestUrl('http://preview-runtime:8080/assets/app.js', 'http://preview-runtime:8080')).toBe(true);
     expect(isAllowedPreviewRequestUrl('data:image/png;base64,AA==', 'http://preview-runtime:8080')).toBe(true);
@@ -337,6 +376,13 @@ describe('managed preview recording boundary', () => {
 
   it('rejects a navigation that finishes on another origin', async () => {
     const input = fixture();
+    vi.stubGlobal('fetch', vi.fn(async (request: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(request instanceof Request ? request.url : request.toString());
+      const method = init.method ?? 'GET';
+      if (url.pathname.endsWith('/branches/iteration-2-evidence')) return new Response('{}', { status: 200 });
+      if (method === 'GET') return new Response(null, { status: 404 });
+      return new Response(null, { status: 201 });
+    }));
     const page = {
       goto: vi.fn().mockResolvedValue({ url: () => 'https://redirected.example.test/' }),
       url: vi.fn().mockReturnValue('https://redirected.example.test/'),

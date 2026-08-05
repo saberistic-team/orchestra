@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@orchestra/contracts": "workspace:*",
+    "@orchestra/database": "workspace:*",
     "@temporalio/worker": "^1.21.1",
     "playwright": "1.62.1"
   },

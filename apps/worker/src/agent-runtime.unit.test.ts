@@ -2,11 +2,18 @@ import { describe, expect, it } from 'vitest';
 import type { AgentMessage, AgentOrder, AgentResult, AuthorityGrant } from '@orchestra/contracts';
 import {
   AgentRuntimeError,
+  beginAgentActivity,
+  beginAgentCommunication,
+  blockAgentActivity,
   bootstrapAgentState,
+  completeAgentActivity,
+  completeAgentCommunication,
+  dequeueNextMessage,
   enqueueMessage,
   getAgentStatus,
   pauseAgent,
   recordResult,
+  resolvePendingQuestion,
   resumeAgent,
   selectNextMessage,
   shouldContinueAsNew,
@@ -154,9 +161,77 @@ describe('agent runtime mailbox', () => {
 
     expect(selectNextMessage(queued)?.messageId).toBe('critical-first');
   });
+
+  it('records a one-way communication and restores a pre-existing blocker after receipt', () => {
+    const handoff = {
+      ...message('handoff'),
+      kind: 'EVIDENCE' as const,
+      name: 'artifact.handoff',
+      acknowledgementRequired: true,
+      payload: { summary: 'Build submission was handed to builder.', iterationNumber: 7 },
+    };
+    const blocked = blockAgentActivity(state(), 'Waiting for a required repository revision.');
+    const queued = enqueueMessage(blocked, handoff);
+    const dequeued = dequeueNextMessage(queued);
+    const receipt = beginAgentCommunication(
+      dequeued.state,
+      dequeued.message!,
+      7,
+      'handoff',
+      handoff.payload.summary,
+    );
+
+    expect(getAgentStatus(receipt.state)).toMatchObject({
+      status: 'ACTIVE', state: 'communicating',
+      activity: { type: 'artifact.handoff', summary: handoff.payload.summary },
+    });
+    expect(receipt.state.interactions).toContainEqual(expect.objectContaining({
+      id: 'received:handoff:builder',
+      from: 'planner', to: ['builder'], kind: 'handoff', status: 'acknowledged', live: true,
+    }));
+
+    const restored = completeAgentCommunication(
+      receipt.state,
+      receipt.baseline,
+      receipt.interactionId,
+      'Handoff received.',
+    );
+    expect(getAgentStatus(restored)).toMatchObject({
+      status: 'BLOCKED', state: 'blocked', blockerCount: 1,
+    });
+    expect(restored.interactions).toContainEqual(expect.objectContaining({
+      id: 'received:handoff:builder', status: 'completed', live: false,
+    }));
+  });
 });
 
 describe('agent runtime orders and controls', () => {
+  it('projects precise organizational activity without implying an idle actor disappeared', () => {
+    const working = beginAgentActivity(state(), {
+      type: 'implementation',
+      summary: 'Implementing the bounded work package.',
+      state: 'working',
+    });
+    const monitoring = completeAgentActivity(working, 'Monitoring the handed-off revision.');
+    const blocked = blockAgentActivity(monitoring, 'Waiting for a required repository revision.');
+
+    expect(getAgentStatus(working)).toMatchObject({
+      status: 'ACTIVE',
+      state: 'working',
+      activity: { type: 'implementation', summary: 'Implementing the bounded work package.' },
+    });
+    expect(getAgentStatus(monitoring)).toMatchObject({
+      status: 'IDLE',
+      state: 'monitoring',
+      activity: { type: 'obligation_monitoring' },
+    });
+    expect(getAgentStatus(blocked)).toMatchObject({
+      status: 'BLOCKED',
+      state: 'blocked',
+      blockerCount: 1,
+    });
+  });
+
   it('rejects an order whose grant does not authorize this target', () => {
     const unauthorized = order({ authority: authority(['IMPLEMENT'], ['reviewer']) });
 
@@ -185,8 +260,35 @@ describe('agent runtime orders and controls', () => {
     expect(getAgentStatus(completed)).toMatchObject({
       mode: 'DORMANT',
       status: 'IDLE',
+      state: 'monitoring',
       activeOrderCount: 0,
       resultCount: 1,
+    });
+  });
+
+  it('keeps a partial order visibly waiting until its durable question is resolved', () => {
+    const running = startOrder(submitOrder(state(), order()), 'order-1');
+    const waiting = recordResult(running, {
+      ...completedResult(running.stateVersion),
+      status: 'PARTIAL',
+      summary: 'A product decision is required.',
+      unresolvedQuestions: [{
+        questionId: 'question-1',
+        question: 'Which persistence strategy should be used?',
+        askedBy: address,
+        targetRoles: ['manager'],
+        status: 'OPEN',
+        contextRefs: ['work-package-1'],
+        createdAt: '2026-08-04T12:00:00.000Z',
+      }],
+    });
+
+    expect(getAgentStatus(waiting)).toMatchObject({
+      status: 'IDLE', state: 'waiting_on_human', pendingQuestionCount: 1,
+    });
+    const resolved = resolvePendingQuestion(waiting, 'question-1');
+    expect(getAgentStatus(resolved)).toMatchObject({
+      status: 'IDLE', state: 'monitoring', pendingQuestionCount: 0,
     });
   });
 
@@ -201,5 +303,17 @@ describe('agent runtime orders and controls', () => {
 
     expect(shouldContinueAsNew(initial)).toBe(false);
     expect(shouldContinueAsNew(transitioned)).toBe(true);
+  });
+
+  it('does not continue as new while an order is active', () => {
+    const initial = bootstrapAgentState({
+      address,
+      graphVersion: 3,
+      eventCount: 2,
+      continueAsNewEventThreshold: 2,
+    });
+    const running = startOrder(submitOrder(initial, order()), 'order-1');
+
+    expect(shouldContinueAsNew(running)).toBe(false);
   });
 });

@@ -1,20 +1,13 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { deliveryAgentGraph, projectBriefSchema, type AgentExecutionGraph, type AgentExecutionNode, type AgentRole, type Project, type ProjectArtifact, type ProjectDetail, type ProjectStatus, type ProjectSummary } from '@orchestra/contracts';
+import { projectBriefSchema, type AgentRole, type Project, type ProjectArtifact, type ProjectDetail, type ProjectStatus, type ProjectSummary } from '@orchestra/contracts';
 import { AgentOrganism } from './AgentOrganism.js';
 import { HumanReviewWorkspace } from './HumanReview.js';
 
 const emptyDraft = { name: '', intent: '', audience: '', success: '', constraints: '' };
 type Draft = typeof emptyDraft;
 interface BeforeInstallPromptEvent extends Event { prompt(): Promise<void>; userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }>; }
-
-const graphPositions: Partial<Record<AgentRole, { x: number; y: number }>> = {
-  manager: { x: 25, y: 170 }, requirements: { x: 225, y: 60 }, product: { x: 225, y: 280 },
-  ux: { x: 425, y: 60 }, architecture: { x: 425, y: 280 }, data: { x: 625, y: 60 }, security: { x: 625, y: 280 },
-  planner: { x: 825, y: 170 }, builder: { x: 1025, y: 170 }, test: { x: 1225, y: 60 }, reviewer: { x: 1225, y: 280 },
-  gate: { x: 1425, y: 170 },
-};
 
 const statusCopy: Record<ProjectStatus, string> = {
   discovering: 'Opening the studio', defining: 'Defining the product', planning: 'Planning the solution',
@@ -83,8 +76,106 @@ function ProjectPage({ id }: { id: string }) {
   const [detail, setDetail] = useState<ProjectDetail>();
   const [error, setError] = useState('');
   const [selectedAgent, setSelectedAgent] = useState<AgentRole>('manager');
-  const load = () => fetch(`/api/projects/${id}`).then((response) => { if (!response.ok) throw new Error(); return response.json(); }).then((value) => { setDetail(value); setError(''); }).catch(() => setError('We could not load this project.'));
-  useEffect(() => { void load(); const timer = window.setInterval(load, 4_000); return () => window.clearInterval(timer); }, [id]);
+  const detailRef = useRef<ProjectDetail | undefined>(undefined);
+  const detailVersionRef = useRef(0);
+  const pageVersionRef = useRef(0);
+  const requestRef = useRef<{ projectId: string; controller: AbortController; token: symbol; promise: Promise<void> } | undefined>(undefined);
+
+  const load = useCallback(() => {
+    const activeRequest = requestRef.current;
+    if (activeRequest?.projectId === id) return activeRequest.promise;
+    activeRequest?.controller.abort();
+
+    const controller = new AbortController();
+    const token = Symbol(id);
+    const pageVersion = pageVersionRef.current;
+    const detailVersion = detailVersionRef.current;
+    const promise = (async () => {
+      try {
+        const response = await fetch(`/api/projects/${id}`, { signal: controller.signal });
+        if (!response.ok) throw new Error();
+        const value = await response.json() as ProjectDetail;
+        if (controller.signal.aborted
+          || pageVersion !== pageVersionRef.current
+          || detailVersion !== detailVersionRef.current) return;
+        detailRef.current = value;
+        detailVersionRef.current += 1;
+        setDetail(value);
+        setError('');
+      } catch {
+        if (controller.signal.aborted || pageVersion !== pageVersionRef.current) return;
+        if (!detailRef.current) setError('We could not load this project.');
+      } finally {
+        if (requestRef.current?.token === token) requestRef.current = undefined;
+      }
+    })();
+    requestRef.current = { projectId: id, controller, token, promise };
+    return promise;
+  }, [id]);
+
+  useEffect(() => {
+    const pageVersion = ++pageVersionRef.current;
+    detailRef.current = undefined;
+    detailVersionRef.current = 0;
+    setDetail(undefined);
+    setError('');
+    let disposed = false;
+    let fallbackTimer: number | undefined;
+    let source: EventSource | undefined;
+
+    const stopFallback = () => {
+      if (fallbackTimer === undefined) return;
+      window.clearInterval(fallbackTimer);
+      fallbackTimer = undefined;
+    };
+    const startFallback = () => {
+      if (disposed || fallbackTimer !== undefined) return;
+      void load();
+      fallbackTimer = window.setInterval(() => { void load(); }, 4_000);
+    };
+    const applySnapshot = (event: MessageEvent<string>) => {
+      if (disposed || pageVersion !== pageVersionRef.current) return;
+      try {
+        const value = JSON.parse(event.data) as ProjectDetail;
+        if (value.project.id !== id) return;
+        detailRef.current = value;
+        detailVersionRef.current += 1;
+        setDetail(value);
+        setError('');
+        stopFallback();
+      } catch {
+        startFallback();
+      }
+    };
+
+    void load().then(() => {
+      if (disposed || pageVersion !== pageVersionRef.current) return;
+      if (!window.EventSource) {
+        startFallback();
+        return;
+      }
+      try {
+        source = new window.EventSource(`/api/projects/${id}/snapshots`);
+        source.onopen = stopFallback;
+        source.onmessage = applySnapshot;
+        source.onerror = startFallback;
+      } catch {
+        startFallback();
+      }
+    });
+
+    return () => {
+      disposed = true;
+      pageVersionRef.current += 1;
+      stopFallback();
+      source?.close();
+      const request = requestRef.current;
+      if (request?.projectId === id) {
+        request.controller.abort();
+        requestRef.current = undefined;
+      }
+    };
+  }, [id, load]);
   if (error) return <section className="empty-state"><h1>Project unavailable.</h1><p>{error}</p><button className="secondary" onClick={() => navigate('/projects')}>Back to projects</button></section>;
   if (!detail) return <div className="loading-card">Collecting the project story and latest artifacts…</div>;
   const { project, events, media } = detail;
@@ -125,79 +216,6 @@ function ProjectPage({ id }: { id: string }) {
       </aside>
     </section>
   </>;
-}
-
-function AgentLoop({ detail }: { detail: ProjectDetail }) {
-  const graph = detail.executionGraph ?? fallbackExecutionGraph(detail);
-  const active = graph.nodes.filter((node) => node.state === 'active');
-  const ready = graph.nodes.filter((node) => node.state === 'ready');
-  const completed = graph.nodes.filter((node) => node.state === 'completed');
-  const focus = active.length ? `${joinLabels(active)} ${active.length === 1 ? 'is' : 'are'} working now.`
-    : ready.length ? `${joinLabels(ready)} ${ready.length === 1 ? 'is' : 'are'} ready to begin.`
-      : completed.length === graph.nodes.length ? 'The agent graph has completed this iteration.' : 'The graph is resolving its next safe handoffs.';
-  const nodeByRole = new Map(graph.nodes.map((node) => [node.role, node]));
-  return <section className="agent-relay agent-network" aria-label="Agent collaboration graph">
-    <div className="network-heading">
-      <div className="relay-copy"><div className="relay-pulse"><span>{active[0]?.icon ?? ready[0]?.icon ?? '✦'}</span></div><div><p className="eyebrow">Live collaboration graph</p><h2>{focus}</h2><p>Branches run when their required artifacts arrive. Supervisors guide work without turning every relationship into a blocker.</p></div></div>
-      <div className="network-stats"><span><strong>{active.length}</strong> active</span><span><strong>{ready.length}</strong> ready</span><span><strong>{completed.length}/{graph.nodes.length}</strong> handed off</span></div>
-    </div>
-    <div className="graph-legend" aria-label="Graph legend"><span className="legend-active">Working</span><span className="legend-ready">Ready together</span><span className="legend-completed">Handed off</span><span className="legend-waiting">Waiting for inputs</span><span className="legend-line">Required artifact</span></div>
-    <div className="graph-viewport" tabIndex={0} aria-label="Scrollable agent dependency map">
-      <div className="graph-board">
-        <svg className="graph-edges" viewBox="0 0 1620 500" aria-hidden="true">
-          <defs><marker id="dependency-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" /></marker></defs>
-          {graph.edges.filter((edge) => edge.kind === 'blocks').map((edge) => {
-            const from = graphPositions[edge.from]; const to = graphPositions[edge.to];
-            if (!from || !to) return null;
-            const sourceState = nodeByRole.get(edge.from)?.state;
-            const targetState = nodeByRole.get(edge.to)?.state;
-            const edgeState = targetState === 'active' || targetState === 'ready' ? 'live' : sourceState === 'completed' ? 'available' : 'waiting';
-            const startX = from.x + 170; const startY = from.y + 85; const endX = to.x - 8; const endY = to.y + 85;
-            const bend = Math.max(35, (endX - startX) / 2);
-            return <path key={`${edge.from}-${edge.to}`} className={`dependency-edge ${edgeState}`} d={`M${startX} ${startY} C${startX + bend} ${startY},${endX - bend} ${endY},${endX} ${endY}`} markerEnd="url(#dependency-arrow)" />;
-          })}
-        </svg>
-        {graph.nodes.map((node) => {
-          const position = graphPositions[node.role];
-          if (!position) return null;
-          const dependencyLabels = node.dependsOn.map((role) => nodeByRole.get(role)?.label ?? role);
-          const supervisorLabels = node.supervisedBy.map((role) => nodeByRole.get(role)?.label ?? role);
-          return <article className={`graph-agent state-${node.state}`} style={{ left: position.x, top: position.y }} key={node.role}>
-            <div className="graph-agent-top"><i>{node.icon}</i><span>{node.state.replace('_', ' ')}</span></div>
-            <h3>{node.label}</h3><p className="agent-model">{node.assignedProvider ? `${node.assignedProvider} · ` : ''}{node.assignedModel}</p>
-            <dl>{dependencyLabels.length > 0 && <><dt>Needs</dt><dd>{dependencyLabels.join(' + ')}</dd></>}{supervisorLabels.length > 0 && <><dt>Guided by</dt><dd>{supervisorLabels.join(' + ')}</dd></>}</dl>
-            <small>Creates {node.artifactName}</small>
-          </article>;
-        })}
-      </div>
-    </div>
-    <div className="network-footnote"><strong>Shared workspace:</strong> every node reads declared upstream artifacts and commits its handoff to the same iteration branch in Forgejo. <span>Model capacity: {graph.modelConcurrency} generation{graph.modelConcurrency === 1 ? '' : 's'} at a time; workflow branches remain independently active and queued.</span></div>
-  </section>;
-}
-
-function joinLabels(nodes: AgentExecutionNode[]) {
-  const labels = nodes.map((node) => node.label);
-  return labels.length < 2 ? labels[0] ?? 'The team' : `${labels.slice(0, -1).join(', ')} and ${labels.at(-1)}`;
-}
-
-function fallbackExecutionGraph(detail: ProjectDetail): AgentExecutionGraph {
-  const iteration = detail.iterations.find((candidate) => candidate.number === detail.project.currentIteration);
-  const iterationArtifacts = detail.artifacts.filter((artifact) => !iteration || artifact.iterationId === iteration.id);
-  const completedRoles = new Set(deliveryAgentGraph.filter((node) => iterationArtifacts.some((artifact) => artifact.type === node.artifactType)).map((node) => node.role));
-  const activeRoles = new Set(detail.events.filter((event) => event.iterationNumber === detail.project.currentIteration && event.kind === 'agent' && event.title.toLowerCase().includes('started') && !completedRoles.has(event.agentRole as never)).map((event) => event.agentRole));
-  const nodes = deliveryAgentGraph.map((node) => ({
-    role: node.role, label: node.label, icon: node.icon, phase: node.phase,
-    state: completedRoles.has(node.role) ? 'completed' as const : activeRoles.has(node.role) ? 'active' as const : 'activation' in node && node.activation === 'authorized_release' ? 'dormant' as const : node.dependsOn.every((dependency) => completedRoles.has(dependency)) ? 'ready' as const : 'waiting' as const,
-    assignedModel: iterationArtifacts.find((artifact) => artifact.producedBy === node.role)?.model ?? 'role model',
-    assignedProvider: iterationArtifacts.find((artifact) => artifact.producedBy === node.role)?.modelProvider ?? undefined,
-    artifactType: node.artifactType, artifactName: node.artifactName, dependsOn: [...node.dependsOn], supervisedBy: [...node.supervisedBy], consumes: [...node.consumes], produces: [...node.produces],
-    startedAt: null, completedAt: iterationArtifacts.find((artifact) => artifact.producedBy === node.role)?.createdAt ?? null,
-  }));
-  const edges: AgentExecutionGraph['edges'] = deliveryAgentGraph.flatMap((node) => [
-    ...node.dependsOn.map((from) => ({ from, to: node.role, kind: 'blocks' as const, artifacts: [] })),
-    ...node.supervisedBy.map((from) => ({ from, to: node.role, kind: 'supervises' as const, artifacts: [] })),
-  ]);
-  return { iterationNumber: detail.project.currentIteration, graphVersion: 1, nodes, edges, modelConcurrency: 1 };
 }
 
 function ArtifactViewer({ artifact }: { artifact: ProjectArtifact }) {

@@ -16,11 +16,15 @@ import {
   agentTaskQueue,
   artifactFeedbackInputSchema,
   deliveryAgentGraph,
+  iterationReviewProposalSchema,
   iterationReviewSchema,
+  agentExecutionStateSchema,
+  organismEventSchema,
   parseAgentModelTaskQueueRole,
   parseAgentRoles,
   parseAgentTaskQueueRole,
   projectBriefSchema,
+  projectDetailSchema,
   projectMediaSchema,
   responsibilities,
 } from './index.js';
@@ -43,6 +47,30 @@ describe('projectBriefSchema', () => {
 });
 
 describe('agent organism contract', () => {
+  it('shares the persistent runtime and event vocabulary with the live UI', () => {
+    expect(agentExecutionStateSchema.options).toEqual([
+      'observing', 'ready', 'planning', 'working', 'reviewing', 'communicating',
+      'waiting_on_agent', 'waiting_on_human', 'monitoring', 'blocked', 'completed_for_iteration',
+    ]);
+    expect(organismEventSchema.parse({
+      schemaVersion: '1.0',
+      eventId: 'event-1',
+      projectId: 'project-1',
+      sequence: 1,
+      type: 'agent.activity.started',
+      correlationId: 'iteration:1:builder',
+      actor: {
+        projectId: 'project-1',
+        role: 'builder',
+        workflowId: 'project/project-1/agent/builder',
+      },
+      subjectRole: 'builder',
+      summary: 'Implementing the approved work package.',
+      payload: { activityType: 'implementation' },
+      createdAt: '2026-08-04T12:00:00.000Z',
+    })).toMatchObject({ type: 'agent.activity.started', sequence: 1 });
+  });
+
   it('defines every normative role and its responsibility once', () => {
     expect(agentRoleDefinitions).toHaveLength(14);
     expect(new Set(agentRoleDefinitions.map((definition) => definition.role)).size).toBe(14);
@@ -62,6 +90,47 @@ describe('agent organism contract', () => {
     expect(agentRelationshipCatalog).toContainEqual(expect.objectContaining({
       from: 'gate', to: 'deployment', kind: 'authorizes',
     }));
+  });
+
+  it('exposes the canonical organism ledger and structured proposal evidence in project detail', () => {
+    expect(projectDetailSchema.keyof().options).toEqual(expect.arrayContaining([
+      'agentGoals',
+      'agentActionPlans',
+      'agentActions',
+      'agentObligations',
+      'organismEvents',
+      'artifactVersions',
+      'findings',
+      'modelInvocations',
+      'repositoryOperations',
+    ]));
+    const agentPositions = Object.fromEntries(agentRoleSchema.options.map((role) => [
+      role,
+      role === 'deployment' || role === 'validation' ? 'not_required' : 'ready',
+    ]));
+    const proposal = iterationReviewProposalSchema.parse({
+      id: 'proposal-1',
+      projectId: 'project-1',
+      iterationId: 'iteration-1',
+      iterationNumber: 1,
+      type: 'iteration_review_proposal',
+      objectiveStatus: 'satisfied',
+      includedRevision: 'a'.repeat(40),
+      completedOutcomes: ['Builder produced Build submission v1'],
+      openFindings: [],
+      agentPositions,
+      gateStatus: 'pass',
+      gateRationale: 'The deterministic Gate check passed.',
+      managerRationale: 'The current revision is ready for human review.',
+      recommendation: 'send_for_human_review',
+      createdAt: '2026-08-04T12:00:00.000Z',
+    });
+    expect(proposal).toMatchObject({
+      proposalVersion: 1,
+      status: 'proposed',
+      knownLimitations: [],
+      budgetSnapshot: { modelInvocationCount: 0, totalTokens: 0, openRouterCostUsd: 0 },
+    });
   });
 });
 

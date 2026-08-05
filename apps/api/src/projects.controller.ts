@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Sse } from '@nestjs/common';
 import { ProjectsService } from './projects.service.js';
 
 @Controller('projects')
@@ -18,6 +18,11 @@ export class ProjectsController {
   @Get(':id')
   find(@Param('id') id: string) {
     return this.projects.find(id);
+  }
+
+  @Sse(':id/snapshots')
+  snapshots(@Param('id') id: string) {
+    return this.projects.snapshots(id);
   }
 
   @Post(':id/review')

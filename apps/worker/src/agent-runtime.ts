@@ -1,5 +1,7 @@
 import type {
   AgentAddress,
+  AgentActivity,
+  AgentExecutionState,
   AgentInteraction,
   AgentMessage,
   AgentMode,
@@ -21,6 +23,11 @@ const modes = [
   'TESTING', 'REVIEW', 'REMEDIATION', 'GATING', 'DEPLOYMENT', 'VALIDATION',
   'INCIDENT', 'ROLLBACK', 'MAINTENANCE', 'BLOCKED', 'PAUSED',
 ] as const satisfies readonly AgentMode[];
+
+const presentationStates = [
+  'observing', 'ready', 'planning', 'working', 'reviewing', 'communicating',
+  'waiting_on_agent', 'waiting_on_human', 'monitoring', 'blocked', 'completed_for_iteration',
+] as const satisfies readonly AgentExecutionState[];
 
 const priorities = ['LOW', 'NORMAL', 'HIGH', 'CRITICAL'] as const;
 const messageKinds = [
@@ -103,6 +110,9 @@ export interface AgentBootstrap {
   projectStateVersion?: number;
   stateVersion?: number;
   mode?: AgentMode;
+  presentationState?: AgentExecutionState;
+  activity?: AgentActivity | null;
+  stateChangedAt?: string;
   continuationSequence?: number;
   eventCount?: number;
   continueAsNewEventThreshold?: number;
@@ -144,6 +154,9 @@ export interface AgentStatusView {
   address: AgentAddress;
   mode: AgentMode;
   status: AgentRuntimeStatus;
+  state: AgentExecutionState;
+  activity: AgentActivity | null;
+  stateChangedAt: string | null;
   graphVersion: number;
   projectStateVersion: number;
   stateVersion: number;
@@ -161,6 +174,9 @@ export interface AgentRuntimeState {
   role: AgentRole;
   mode: AgentMode;
   status: AgentRuntimeStatus;
+  presentationState: AgentExecutionState;
+  activity: AgentActivity | null;
+  stateChangedAt: string;
   modeBeforePause?: AgentMode;
   graphVersion: number;
   projectStateVersion: number;
@@ -175,6 +191,20 @@ export interface AgentRuntimeState {
   continuationSequence: number;
   eventCount: number;
   continueAsNewEventThreshold: number;
+}
+
+export interface AgentCommunicationBaseline {
+  mode: AgentMode;
+  status: AgentRuntimeStatus;
+  presentationState: AgentExecutionState;
+  activity: AgentActivity | null;
+  blockers: readonly AgentBlockerView[];
+}
+
+export interface AgentCommunicationReceipt {
+  state: AgentRuntimeState;
+  baseline: AgentCommunicationBaseline;
+  interactionId: string;
 }
 
 export interface DequeuedMessage {
@@ -325,9 +355,11 @@ function addressesMatch(left: AgentAddress, right: AgentAddress): boolean {
 type RuntimePatch = Omit<Partial<AgentRuntimeState>, 'stateVersion' | 'eventCount'>;
 
 function transition(state: AgentRuntimeState, patch: RuntimePatch): AgentRuntimeState {
+  const stateChanged = patch.presentationState !== undefined && patch.presentationState !== state.presentationState;
   return {
     ...state,
     ...patch,
+    stateChangedAt: stateChanged ? new Date().toISOString() : patch.stateChangedAt ?? state.stateChangedAt,
     stateVersion: state.stateVersion + 1,
     eventCount: state.eventCount + 1,
   };
@@ -343,7 +375,14 @@ export function bootstrapAgentState(bootstrap: AgentBootstrap): AgentRuntimeStat
     || !isNonNegativeInteger(bootstrap.eventCount ?? 0)
     || !isNonNegativeInteger(bootstrap.continuationSequence ?? 0)
     || !isPositiveInteger(bootstrap.continueAsNewEventThreshold ?? DEFAULT_CONTINUE_AS_NEW_EVENT_THRESHOLD)
-    || !modes.includes((bootstrap.mode ?? 'DORMANT') as AgentMode)) {
+    || !modes.includes((bootstrap.mode ?? 'DORMANT') as AgentMode)
+    || !presentationStates.includes((bootstrap.presentationState ?? 'observing') as AgentExecutionState)
+    || (bootstrap.stateChangedAt !== undefined && !isNonBlankString(bootstrap.stateChangedAt))
+    || (bootstrap.activity !== undefined && bootstrap.activity !== null && (
+      !isNonBlankString(bootstrap.activity.type)
+      || !isNonBlankString(bootstrap.activity.summary)
+      || (bootstrap.activity.startedAt !== null && !isNonBlankString(bootstrap.activity.startedAt))
+    ))) {
     fail('INVALID_BOOTSTRAP', 'Bootstrap versions, mode, or continuation threshold are invalid.');
   }
   const recentMessageIds = [...(bootstrap.recentMessageIds ?? [])];
@@ -359,6 +398,9 @@ export function bootstrapAgentState(bootstrap: AgentBootstrap): AgentRuntimeStat
     role,
     mode: bootstrap.mode ?? 'DORMANT',
     status: bootstrap.mode === 'PAUSED' ? 'PAUSED' : 'IDLE',
+    presentationState: bootstrap.presentationState ?? 'observing',
+    activity: bootstrap.activity ?? null,
+    stateChangedAt: bootstrap.stateChangedAt ?? new Date().toISOString(),
     graphVersion: bootstrap.graphVersion,
     projectStateVersion: bootstrap.projectStateVersion ?? 0,
     stateVersion: bootstrap.stateVersion ?? 0,
@@ -408,6 +450,7 @@ export function enqueueMessage(state: AgentRuntimeState, message: AgentMessage):
       idempotencyKey: message.idempotencyKey,
     }],
     status: state.status === 'IDLE' ? 'READY' : state.status,
+    presentationState: state.status === 'IDLE' ? 'ready' : state.presentationState,
   });
 }
 
@@ -487,6 +530,7 @@ export function submitOrder(state: AgentRuntimeState, order: AgentOrder): AgentR
     orders: [...orders, { order, status: 'ACCEPTED', acceptedAtStateVersion: nextVersion }],
     mode: order.loopPolicy.mode,
     status: state.status === 'PAUSED' ? 'PAUSED' : 'READY',
+    presentationState: state.status === 'PAUSED' ? 'monitoring' : 'ready',
   });
 }
 
@@ -512,6 +556,12 @@ export function startOrder(state: AgentRuntimeState, orderId: string): AgentRunt
     orders: state.orders.map((candidate) => candidate === record ? { ...candidate, status: 'IN_PROGRESS' } : candidate),
     mode: record.order.loopPolicy.mode,
     status: 'ACTIVE',
+    presentationState: executionStateForMode(record.order.loopPolicy.mode),
+    activity: {
+      type: record.order.type.toLowerCase(),
+      summary: record.order.objective,
+      startedAt: new Date().toISOString(),
+    },
     blockers: state.blockers.filter((blocker) => blocker.orderId !== orderId),
   });
 }
@@ -520,7 +570,7 @@ export function pauseAgent(state: AgentRuntimeState, authority: AuthorityGrant):
   validateAuthorityForAction(authority, state.role, 'PAUSE');
   if (state.status === 'CANCELLED') fail('INVALID_TRANSITION', 'A cancelled agent cannot be paused.');
   if (state.status === 'PAUSED') return state;
-  return transition(state, { modeBeforePause: state.mode, mode: 'PAUSED', status: 'PAUSED' });
+  return transition(state, { modeBeforePause: state.mode, mode: 'PAUSED', status: 'PAUSED', presentationState: 'monitoring' });
 }
 
 export function resumeAgent(state: AgentRuntimeState, authority: AuthorityGrant): AgentRuntimeState {
@@ -533,6 +583,9 @@ export function resumeAgent(state: AgentRuntimeState, authority: AuthorityGrant)
     mode: state.modeBeforePause ?? 'DORMANT',
     modeBeforePause: undefined,
     status: hasInProgress ? 'ACTIVE' : hasReadyWork ? 'READY' : 'IDLE',
+    presentationState: hasInProgress
+      ? executionStateForMode(state.modeBeforePause ?? 'DORMANT')
+      : hasReadyWork ? 'ready' : state.results.length > 0 ? 'monitoring' : 'observing',
   });
 }
 
@@ -550,6 +603,8 @@ export function cancelOrder(
     orders: state.orders.map((candidate) => candidate === record ? { ...candidate, status: 'CANCELLED' } : candidate),
     mode: remaining.length === 0 ? 'DORMANT' : state.mode,
     status: state.status === 'PAUSED' ? 'PAUSED' : remaining.length === 0 ? 'IDLE' : 'READY',
+    presentationState: remaining.length === 0 ? 'monitoring' : 'ready',
+    activity: remaining.length === 0 ? null : state.activity,
     blockers: state.blockers.filter((blocker) => blocker.orderId !== orderId),
   });
 }
@@ -561,6 +616,8 @@ export function cancelAgent(state: AgentRuntimeState, authority: AuthorityGrant)
     orders: state.orders.map((record) => isActiveOrder(record) ? { ...record, status: 'CANCELLED' } : record),
     mode: 'DORMANT',
     status: 'CANCELLED',
+    presentationState: 'completed_for_iteration',
+    activity: null,
     blockers: [],
   });
 }
@@ -607,6 +664,161 @@ export function recordResult(state: AgentRuntimeState, result: AgentResult): Age
     pendingQuestions: [...state.pendingQuestions, ...result.unresolvedQuestions],
     mode: nextMode,
     status: state.status === 'PAUSED' ? 'PAUSED' : nextStatus,
+    presentationState: result.unresolvedQuestions.length > 0
+      ? 'waiting_on_human'
+      : result.status === 'BLOCKED' ? 'blocked'
+        : remaining.length === 0 ? 'monitoring' : 'ready',
+    activity: remaining.length === 0 || result.status === 'BLOCKED' ? null : state.activity,
+  });
+}
+
+export function resolvePendingQuestion(state: AgentRuntimeState, questionId: string): AgentRuntimeState {
+  if (!isNonBlankString(questionId)) fail('INVALID_TRANSITION', 'A resolved question requires an id.');
+  const pendingQuestions = state.pendingQuestions.filter((question) => question.questionId !== questionId);
+  if (pendingQuestions.length === state.pendingQuestions.length) return state;
+  return transition(state, {
+    pendingQuestions,
+    presentationState: pendingQuestions.length > 0
+      ? 'waiting_on_human'
+      : activeOrders(state).length > 0 ? executionStateForMode(state.mode) : 'monitoring',
+  });
+}
+
+function executionStateForMode(mode: AgentMode): AgentExecutionState {
+  if (['TESTING', 'REVIEW', 'GATING', 'VALIDATION'].includes(mode)) return 'reviewing';
+  if (['DISCOVERY', 'DEFINITION', 'DESIGN', 'PLANNING'].includes(mode)) return 'planning';
+  if (mode === 'BLOCKED') return 'blocked';
+  if (mode === 'PAUSED' || mode === 'MAINTENANCE' || mode === 'DORMANT') return 'monitoring';
+  return 'working';
+}
+
+export function beginAgentActivity(
+  state: AgentRuntimeState,
+  activity: { type: string; summary: string; state?: 'planning' | 'working' | 'reviewing' | 'communicating' },
+): AgentRuntimeState {
+  if (!isNonBlankString(activity.type) || !isNonBlankString(activity.summary)) {
+    fail('INVALID_TRANSITION', 'An activity requires a type and summary.');
+  }
+  return transition(state, {
+    status: 'ACTIVE',
+    presentationState: activity.state ?? 'working',
+    blockers: state.blockers.filter((blocker) => blocker.blockerId !== 'activity:current'),
+    activity: {
+      type: activity.type,
+      summary: activity.summary,
+      startedAt: new Date().toISOString(),
+    },
+  });
+}
+
+export function completeAgentActivity(state: AgentRuntimeState, summary?: string): AgentRuntimeState {
+  return transition(state, {
+    status: state.mailbox.length > 0 ? 'READY' : 'IDLE',
+    mode: state.mailbox.length > 0 ? state.mode : 'DORMANT',
+    presentationState: state.mailbox.length > 0 ? 'ready' : 'monitoring',
+    blockers: state.blockers.filter((blocker) => blocker.blockerId !== 'activity:current'),
+    activity: summary
+      ? { type: 'obligation_monitoring', summary, startedAt: new Date().toISOString() }
+      : null,
+  });
+}
+
+/**
+ * Projects receipt of a one-way protocol notification without turning it into
+ * an executable order. The returned baseline lets the actor restore any
+ * blocked or active semantic state after the short communicating phase.
+ */
+export function beginAgentCommunication(
+  state: AgentRuntimeState,
+  message: AgentMessage,
+  iterationNumber: number,
+  kind: AgentInteraction['kind'],
+  summary: string,
+): AgentCommunicationReceipt {
+  validateAgentMessage(message);
+  if (!isPositiveInteger(iterationNumber) || !isNonBlankString(summary)) {
+    fail('INVALID_TRANSITION', 'A received agent communication requires an iteration and summary.');
+  }
+  const baseline: AgentCommunicationBaseline = {
+    mode: state.mode,
+    // Dequeuing the final mailbox item normally returns an orderless actor to
+    // IDLE. A durable blocker is semantic state, so do not let that dequeue
+    // bookkeeping erase it while acknowledging a notification.
+    status: state.presentationState === 'blocked' || state.mode === 'BLOCKED'
+      ? 'BLOCKED'
+      : state.status,
+    presentationState: state.presentationState,
+    activity: state.activity,
+    blockers: state.blockers,
+  };
+  const interactionId = `received:${message.messageId}:${state.role}`;
+  const communicating = beginAgentActivity(state, {
+    type: message.name,
+    summary,
+    state: 'communicating',
+  });
+  return {
+    baseline,
+    interactionId,
+    state: recordInteraction(communicating, {
+      id: interactionId,
+      messageId: message.messageId,
+      correlationId: message.correlationId,
+      iterationNumber,
+      from: message.sender.role,
+      to: [state.role],
+      kind,
+      name: message.name,
+      summary,
+      status: 'acknowledged',
+      createdAt: new Date().toISOString(),
+      artifactRefs: message.artifactRefs,
+      priority: message.priority.toLowerCase() as 'low' | 'normal' | 'high' | 'critical',
+      requiresAcknowledgement: message.acknowledgementRequired,
+      live: true,
+    }),
+  };
+}
+
+/** Finish a one-way receipt and restore the actor's pre-notification work. */
+export function completeAgentCommunication(
+  state: AgentRuntimeState,
+  baseline: AgentCommunicationBaseline,
+  interactionId: string,
+  summary: string,
+): AgentRuntimeState {
+  if (!isNonBlankString(interactionId) || !isNonBlankString(summary)) {
+    fail('INVALID_TRANSITION', 'Completing an agent communication requires an interaction and summary.');
+  }
+  const queued = state.mailbox.length > 0;
+  const wasIdle = baseline.status === 'IDLE';
+  return transition(state, {
+    mode: baseline.mode,
+    status: wasIdle && queued ? 'READY' : baseline.status,
+    presentationState: wasIdle
+      ? queued ? 'ready' : 'monitoring'
+      : baseline.presentationState,
+    activity: wasIdle && !queued
+      ? { type: 'obligation_monitoring', summary, startedAt: new Date().toISOString() }
+      : baseline.activity,
+    blockers: baseline.blockers,
+    interactions: state.interactions.map((interaction) => interaction.id === interactionId
+      ? { ...interaction, status: 'completed' as const, live: false }
+      : interaction),
+  });
+}
+
+export function blockAgentActivity(state: AgentRuntimeState, summary: string): AgentRuntimeState {
+  if (!isNonBlankString(summary)) fail('INVALID_TRANSITION', 'A blocked activity requires a summary.');
+  return transition(state, {
+    status: 'BLOCKED',
+    mode: 'BLOCKED',
+    presentationState: 'blocked',
+    activity: { type: 'blocker_resolution', summary, startedAt: new Date().toISOString() },
+    blockers: [
+      ...state.blockers.filter((blocker) => blocker.blockerId !== 'activity:current'),
+      { blockerId: 'activity:current', summary },
+    ],
   });
 }
 
@@ -655,6 +867,9 @@ export function getAgentStatus(state: AgentRuntimeState): AgentStatusView {
     address: state.address,
     mode: state.mode,
     status: state.status,
+    state: state.presentationState,
+    activity: state.activity,
+    stateChangedAt: state.stateChangedAt,
     graphVersion: state.graphVersion,
     projectStateVersion: state.projectStateVersion,
     stateVersion: state.stateVersion,
@@ -683,5 +898,7 @@ export function shouldContinueAsNew(
   if (!isPositiveInteger(eventThreshold)) {
     fail('INVALID_TRANSITION', 'Continue-As-New event threshold must be a positive integer.');
   }
-  return state.eventCount >= eventThreshold;
+  return state.eventCount >= eventThreshold
+    && activeOrders(state).length === 0
+    && state.pendingQuestions.length === 0;
 }

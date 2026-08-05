@@ -48,24 +48,34 @@ test('a non-technical founder can save an idea and open its project studio', asy
   await expect(page.getByLabel('Give your idea a name')).toHaveValue(project.name);
   await page.getByRole('button', { name: 'Start my project →' }).click();
   await expect(page.getByRole('heading', { name: project.name })).toBeVisible();
-  await expect(page.getByText('Requirements baseline is ready').first()).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Inspect Requirements baseline is ready' })).toBeVisible();
 });
 
 test('a project dashboard opens review artifacts, recordings, and preview link', async ({ page }) => {
-  await page.route('**/api/projects/*', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(detail) }));
-  await page.route('**/api/projects', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([{ ...project, latestEvent: detail.events[0], artifactCount: 1 }]) }));
+  const builderArtifacts = ['Application shell', 'Request form', 'Container definition'].map((name, index) => ({
+    ...detail.artifacts[0],
+    id: `45f5f325-dca2-4016-9f1a-127cfdc909b${index}`,
+    type: 'source-file',
+    name,
+    producedBy: 'builder',
+    repositoryPath: `src/generated-${index}.ts`,
+    createdAt: `2026-08-03T12:0${index + 1}:00.000Z`,
+  }));
+  const groupedDetail = { ...detail, artifacts: [...detail.artifacts, ...builderArtifacts] };
+  await page.route('**/api/projects/*', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(groupedDetail) }));
+  await page.route('**/api/projects', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([{ ...project, latestEvent: detail.events[0], artifactCount: 4 }]) }));
   await page.goto('http://127.0.0.1:4173/projects');
   await expect(page.getByRole('heading', { name: project.name })).toBeVisible();
   await page.getByRole('link', { name: project.name }).click();
   await expect(page.getByRole('heading', { name: 'Evidence by iteration' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'UX is working now.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'UX is active now.' })).toBeVisible();
   const organism = page.locator('section.organism');
   await expect(organism).toBeVisible();
-  await expect(organism.locator('.organism-agent')).toHaveCount(14);
-  await expect(organism.locator('.organism-agent').filter({ hasText: 'Deployment' })).toContainText('Dormant');
-  await expect(organism.locator('.organism-agent').filter({ hasText: 'Validation' })).toContainText('Dormant');
+  await expect(organism.locator('.organism-graph-agent')).toHaveCount(14);
+  await expect(organism.locator('.organism-graph-agent').filter({ hasText: 'Deployment' })).toContainText('Observing');
+  await expect(organism.locator('.organism-graph-agent').filter({ hasText: 'Validation' })).toContainText('Observing');
   await expect(organism.getByRole('region', { name: /execution path/i })).toHaveCount(0);
-  await expect(organism.getByRole('heading', { name: 'Recent agent exchanges' })).toBeVisible();
+  await expect(organism.getByRole('heading', { name: 'Messages, findings, evidence and decisions' })).toBeVisible();
   await expect(organism.getByRole('tab', { name: /^Open/ })).toBeVisible();
   await expect(organism.getByRole('tab', { name: /^Answered/ })).toBeVisible();
   await expect(organism.getByRole('tab', { name: /^Comments/ })).toBeVisible();
@@ -76,6 +86,12 @@ test('a project dashboard opens review artifacts, recordings, and preview link',
   await expect(page.getByText('Requesting a favor')).toBeVisible();
   await expect(page.getByRole('link', { name: 'Try the latest version ↗' })).toHaveAttribute('href', project.previewUrl);
   await expect(page.getByRole('link', { name: 'Open project repository ↗' })).toHaveAttribute('href', project.repositoryUrl);
+  const builderGroup = page.locator('details.artifact-producer').filter({ hasText: 'Builder' });
+  await expect(builderGroup).toContainText('3 artifacts');
+  await expect(builderGroup.getByRole('button', { name: 'Open Application shell, version 1' })).toBeHidden();
+  await builderGroup.locator('summary').click();
+  await expect(builderGroup.getByRole('button', { name: 'Open Application shell, version 1' })).toBeVisible();
+  await page.locator('details.artifact-producer').filter({ hasText: 'Requirements baseline' }).locator('summary').click();
   await page.getByRole('button', { name: 'Open Requirements baseline, version 1' }).click();
   const artifactDialog = page.getByRole('dialog', { name: 'Requirements baseline' });
   await expect(artifactDialog.locator('.markdown-viewer').getByRole('heading', { name: 'Requirements', exact: true })).toBeVisible();
@@ -263,11 +279,11 @@ test('a human can answer agents, comment, review exact evidence, and submit stru
   await expect(page.getByRole('heading', { name: 'Questions and direction' })).toHaveCount(0);
 
   const organism = page.locator('section.organism');
-  const productCard = organism.getByRole('button', { name: /Product.*needs human answer/i });
-  const securityCard = organism.getByRole('button', { name: /Security.*needs human answer/i });
+  const productCard = organism.getByRole('button', { name: /Product.*needs human attention/i });
+  const securityCard = organism.getByRole('button', { name: /Security.*needs human attention/i });
   await expect(productCard).toBeVisible();
   await expect(securityCard).toBeVisible();
-  await expect(organism.locator('.organism-agent--needs-human')).toHaveCount(2);
+  await expect(organism.locator('.organism-graph-agent.needs-human')).toHaveCount(2);
 
   await productCard.click();
   await expect(organism.getByRole('heading', { name: 'Product', exact: true })).toBeVisible();
@@ -302,12 +318,16 @@ test('a human can answer agents, comment, review exact evidence, and submit stru
 
   await expect(page.getByRole('heading', { name: 'Iteration 2 review evidence' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Iteration 1 review evidence' })).toBeVisible();
+  await page.locator('.iteration-evidence').filter({ hasText: 'Iteration 2 review evidence' })
+    .locator('details.artifact-producer').filter({ hasText: 'Reviewer' }).locator('summary').click();
   await page.getByRole('button', { name: 'Open Review decision, version 1' }).click();
   const dialog = page.getByRole('dialog', { name: 'Review decision' });
   await dialog.getByLabel(/Your note/).fill('Clarify the evidence behind the readiness conclusion.');
   await page.keyboard.press('Escape');
   await expect(dialog).toBeHidden();
 
+  await page.locator('.iteration-evidence').filter({ hasText: 'Iteration 1 review evidence' })
+    .locator('details.artifact-producer').filter({ hasText: 'Requirements' }).locator('summary').click();
   await page.getByRole('button', { name: 'Open Requirements baseline, version 1' }).click();
   const historicalDialog = page.getByRole('dialog', { name: 'Requirements baseline' });
   await historicalDialog.getByLabel(/Your note/).fill('Carry this privacy requirement into the current iteration.');

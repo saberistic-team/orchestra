@@ -64,6 +64,90 @@
       "when": 1785867600000,
       "tag": "0008_canonical_human_decisions",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1785873978000,
+      "tag": "0009_living_organism_ledger",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1785874800000,
+      "tag": "0010_dynamic_execution_trace",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1785877200000,
+      "tag": "0011_agent_question_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1785877800000,
+      "tag": "0012_agent_message_completion",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1785878400000,
+      "tag": "0013_agent_message_protocol_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1785879000000,
+      "tag": "0014_agent_artifact_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1785879600000,
+      "tag": "0015_agent_artifact_staging",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1785880200000,
+      "tag": "0016_review_proposal_manager_rationale",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1785880800000,
+      "tag": "0017_project_media_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1785881400000,
+      "tag": "0018_artifact_operation_recovery",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1785882000000,
+      "tag": "0019_review_proposal_objective_truth",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1785882600000,
+      "tag": "0020_temporal_payload_blobs",
+      "breakpoints": true
     }
   ]
 }

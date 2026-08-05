@@ -23,14 +23,37 @@ import {
   OLLAMA_INFERENCE_LANE_RESPONSE_SIGNAL,
   OLLAMA_INFERENCE_LANE_WAKE_SIGNAL,
   OLLAMA_INFERENCE_LANE_WORKFLOW_ID,
+  buildAgentModelActionRequest,
+  completeAgentModelAction,
   executeModelInteraction,
+  finalizeAgentModelCandidate,
   formatInferenceFailure,
+  remainingModelInferenceDeadlineMs,
+  type AgentModelActionRequest,
+  type AgentModelActionResult,
   type OllamaInferenceLaneRequest,
   type OllamaInferenceLaneResponse,
   type BoundInferenceRequest,
   type OllamaInferenceRequest,
   type OllamaInferenceResult,
 } from './model-protocol.js';
+
+function remainingInferenceWaitMs(inference: OllamaInferenceRequest) {
+  return inference.inferenceBudget
+    ? remainingModelInferenceDeadlineMs(inference.inferenceBudget, Date.now())
+    : undefined;
+}
+
+function assertInferenceDeadlineOpen(inference: OllamaInferenceRequest) {
+  const remainingMs = remainingInferenceWaitMs(inference);
+  if (remainingMs !== undefined && remainingMs <= 0) {
+    throw ApplicationFailure.nonRetryable(
+      'Inference deadline elapsed before provider execution.',
+      'InferenceDeadlineExceeded',
+    );
+  }
+  return remainingMs;
+}
 
 interface InferenceActivities {
   ollamaInference(request: OllamaInferenceRequest): Promise<OllamaInferenceResult>;
@@ -116,10 +139,12 @@ export async function ollamaInferenceLaneWorkflow(): Promise<never> {
 
     let response: OllamaInferenceLaneResponse;
     try {
+      const remainingMs = assertInferenceDeadlineOpen(request.inference);
       const result = await executeChild<typeof ollamaInferenceWorkflow>('ollamaInferenceWorkflow', {
         workflowId: `ollama-inference/${request.requestId}`,
         taskQueue: OLLAMA_INFERENCE_TASK_QUEUE,
         args: [request.inference],
+        ...(remainingMs !== undefined ? { workflowExecutionTimeout: remainingMs } : {}),
       });
       response = { requestId: request.requestId, ok: true, result };
     } catch (error) {
@@ -138,6 +163,118 @@ export async function ollamaInferenceLaneWorkflow(): Promise<never> {
     if (inbox.length === 0 && workflowInfo().continueAsNewSuggested) {
       await continueAsNew<typeof ollamaInferenceLaneWorkflow>();
     }
+  }
+}
+
+/**
+ * One replay-safe model reasoning request for a role-specific brain queue.
+ *
+ * This is intentionally separate from the legacy artifact interaction below:
+ * callers own any plan/observe/assess loop, while each provider request remains
+ * visible as its own child Workflow and local Ollama remains globally serialized.
+ */
+export async function modelReasoningWorkflow(
+  inference: OllamaInferenceRequest,
+): Promise<OllamaInferenceResult> {
+  const execution = workflowInfo();
+  const responses = new Map<string, OllamaInferenceLaneResponse>();
+
+  setHandler(ollamaInferenceCompleted, (response) => {
+    responses.set(response.requestId, response);
+  });
+
+  try {
+    assertInferenceDeadlineOpen(inference);
+    const policy = await policyActivities.resolveInferencePolicy(inference.role);
+    assertInferenceDeadlineOpen(inference);
+    const boundInference: BoundInferenceRequest = {
+      ...inference,
+      provider: policy.provider,
+      model: policy.model,
+    };
+
+    if (!policy.serialize) {
+      const remainingMs = assertInferenceDeadlineOpen(inference);
+      return await executeChild<typeof openRouterInferenceWorkflow>('openRouterInferenceWorkflow', {
+        workflowId: `openrouter-inference/${execution.runId}/1-${inference.purpose}-r${inference.round}`,
+        taskQueue: OPENROUTER_INFERENCE_TASK_QUEUE,
+        args: [boundInference],
+        ...(remainingMs !== undefined ? { workflowExecutionTimeout: remainingMs } : {}),
+      });
+    }
+
+    const requestId = `${execution.runId}:1`;
+    const request: OllamaInferenceLaneRequest = {
+      requestId,
+      replyWorkflowId: execution.workflowId,
+      replyWorkflowRunId: execution.runId,
+      inference: boundInference,
+    };
+
+    await getExternalWorkflowHandle(OLLAMA_INFERENCE_LANE_WORKFLOW_ID)
+      .signal(submitOllamaInference, request);
+    const remainingMs = assertInferenceDeadlineOpen(inference);
+    let received = true;
+    if (remainingMs === undefined) await condition(() => responses.has(requestId));
+    else received = await condition(() => responses.has(requestId), remainingMs);
+    if (!received) {
+      throw ApplicationFailure.nonRetryable(
+        'Inference deadline elapsed while waiting in the Ollama queue.',
+        'InferenceDeadlineExceeded',
+      );
+    }
+    const response = responses.get(requestId);
+    responses.delete(requestId);
+    if (!response) {
+      throw ApplicationFailure.nonRetryable(
+        `Ollama inference response ${requestId} was lost.`,
+        'OllamaInferenceLost',
+      );
+    }
+    if (!response.ok) {
+      throw ApplicationFailure.nonRetryable(response.error, 'OllamaInferenceFailed');
+    }
+    return response.result;
+  } catch (error) {
+    if (error instanceof ApplicationFailure) throw error;
+    throw ApplicationFailure.nonRetryable(
+      formatInferenceFailure(error),
+      'ModelReasoningFailed',
+    );
+  }
+}
+
+/**
+ * One high-level artifact-model operation. Generation, review and revision
+ * each perform exactly one routed inference; finalization is deterministic and
+ * only validates/parses a previously recorded candidate.
+ */
+export async function agentModelActionWorkflow(
+  request: AgentModelActionRequest,
+): Promise<AgentModelActionResult> {
+  try {
+    if (request.action === 'finalize_candidate') {
+      return {
+        action: request.action,
+        draft: finalizeAgentModelCandidate(request),
+      };
+    }
+
+    const inferenceRequest = buildAgentModelActionRequest(request);
+    if (!inferenceRequest) {
+      throw ApplicationFailure.nonRetryable(
+        `No inference request was built for ${request.action}.`,
+        'AgentModelActionInvalid',
+      );
+    }
+    const inference = await modelReasoningWorkflow(inferenceRequest);
+    return completeAgentModelAction(request.action, inferenceRequest, inference);
+  } catch (error) {
+    if (error instanceof ApplicationFailure) throw error;
+    throw ApplicationFailure.nonRetryable(
+      formatInferenceFailure(error),
+      'AgentModelActionFailed',
+    );
   }
 }
 
@@ -198,10 +335,12 @@ export async function modelInteractionWorkflow(
           return await openRouterActivities.openRouterInference(boundInference);
         }
         requestSequence += 1;
+        const remainingMs = assertInferenceDeadlineOpen(inference);
         return await executeChild<typeof openRouterInferenceWorkflow>('openRouterInferenceWorkflow', {
           workflowId: `openrouter-inference/${execution.runId}/${requestSequence}-${inference.purpose}-r${inference.round}`,
           taskQueue: OPENROUTER_INFERENCE_TASK_QUEUE,
           args: [boundInference],
+          ...(remainingMs !== undefined ? { workflowExecutionTimeout: remainingMs } : {}),
         });
       }
 
@@ -216,7 +355,14 @@ export async function modelInteractionWorkflow(
 
       await getExternalWorkflowHandle(OLLAMA_INFERENCE_LANE_WORKFLOW_ID)
         .signal(submitOllamaInference, request);
-      await condition(() => responses.has(requestId));
+      const remainingMs = assertInferenceDeadlineOpen(inference);
+      if (remainingMs === undefined) await condition(() => responses.has(requestId));
+      else if (!await condition(() => responses.has(requestId), remainingMs)) {
+        throw ApplicationFailure.nonRetryable(
+          'Inference deadline elapsed while waiting in the Ollama queue.',
+          'InferenceDeadlineExceeded',
+        );
+      }
       const response = responses.get(requestId);
       responses.delete(requestId);
       if (!response) {

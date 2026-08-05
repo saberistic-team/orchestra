@@ -14,6 +14,7 @@
     "@nestjs/core": "^11.1.28",
     "@nestjs/platform-fastify": "^11.1.28",
     "@orchestra/contracts": "workspace:*",
+    "@orchestra/database": "workspace:*",
     "@temporalio/client": "^1.21.1",
     "fastify": "^5.11.2",
     "reflect-metadata": "^0.2.2",

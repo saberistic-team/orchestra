@@ -3,6 +3,7 @@ import type { Project, ProjectArtifact, ProjectIteration } from '@orchestra/cont
 import {
   applyIterationReviewLifecycle,
   assertSafeGeneratedSourcePath,
+  addIterationCommentOnce,
   commitArtifact,
   createForgejoLifecycleAdapter,
   ensureProjectRepository,
@@ -67,7 +68,7 @@ function artifact(overrides: Partial<ProjectArtifact> = {}): ProjectArtifact {
   };
 }
 
-function contentFetch(existingSha?: string) {
+function contentFetch(existingSha?: string, existingContent?: string) {
   const calls: Array<{ url: URL; method: string; body?: BodyInit | null }> = [];
   const fetchMock = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
     const url = new URL(input instanceof Request ? input.url : input.toString());
@@ -75,7 +76,13 @@ function contentFetch(existingSha?: string) {
     calls.push({ url, method, body: init.body });
     if (method === 'GET' && url.pathname.includes('/contents/')) {
       return existingSha
-        ? new Response(JSON.stringify({ sha: existingSha }), { status: 200, headers: { 'content-type': 'application/json' } })
+        ? new Response(JSON.stringify({
+          sha: existingSha,
+          ...(existingContent === undefined ? {} : {
+            content: Buffer.from(existingContent).toString('base64'),
+            encoding: 'base64',
+          }),
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
         : new Response(null, { status: 404 });
     }
     return new Response(null, { status: 201 });
@@ -305,6 +312,30 @@ describe('Forgejo iteration lifecycle', () => {
 });
 
 describe('Forgejo artifact commits', () => {
+  it('recovers an artifact comment retry by its hidden operation marker', async () => {
+    const calls: Array<{ url: URL; method: string; body?: BodyInit | null }> = [];
+    let storedBody: string | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      const method = init.method ?? 'GET';
+      calls.push({ url, method, body: init.body });
+      if (method === 'GET') {
+        return new Response(JSON.stringify(storedBody ? [{ body: storedBody }] : []), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      storedBody = (JSON.parse(String(init.body)) as { body: string }).body;
+      return new Response(null, { status: 201 });
+    }));
+
+    await addIterationCommentOnce(project, iteration, 'Artifact committed.', 'artifact-operation-1');
+    await addIterationCommentOnce(project, iteration, 'Artifact committed.', 'artifact-operation-1');
+
+    expect(calls.map((call) => call.method)).toEqual(['GET', 'POST', 'GET']);
+    expect(storedBody).toContain('<!-- orchestra-operation:');
+  });
+
   it('creates a new artifact file with POST after the target-branch lookup returns 404', async () => {
     const calls = contentFetch();
 
@@ -319,6 +350,54 @@ describe('Forgejo artifact commits', () => {
     expect(contentCalls.map((call) => call.method)).toEqual(['GET', 'POST']);
     expect(contentCalls[0]?.url.searchParams.get('ref')).toBe('iteration-1-agents');
     expect(JSON.parse(String(contentCalls[1]?.body))).not.toHaveProperty('sha');
+  });
+
+  it('treats an already-written identical file as a successful idempotent retry', async () => {
+    const content = '# Build\n';
+    const calls = contentFetch('existing-sha', content);
+
+    await commitArtifact(project, iteration, artifact({
+      type: 'build-submission',
+      name: 'Build submission',
+      mimeType: 'text/markdown',
+      content,
+    }));
+
+    const contentCalls = calls.filter((call) => call.url.pathname.includes('/contents/'));
+    expect(contentCalls.map((call) => call.method)).toEqual(['GET']);
+  });
+
+  it('accepts a concurrent create conflict only after verifying the stored content', async () => {
+    const content = '# Concurrent build\n';
+    const calls: Array<{ url: URL; method: string }> = [];
+    let lookupCount = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      const method = init.method ?? 'GET';
+      calls.push({ url, method });
+      if (method === 'GET' && url.pathname.includes('/contents/')) {
+        lookupCount += 1;
+        return lookupCount === 1
+          ? new Response(null, { status: 404 })
+          : new Response(JSON.stringify({
+            sha: 'concurrent-sha',
+            content: Buffer.from(content).toString('base64'),
+            encoding: 'base64',
+          }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (method === 'POST' && url.pathname.includes('/contents/')) return new Response(null, { status: 409 });
+      return new Response(null, { status: 201 });
+    }));
+
+    await commitArtifact(project, iteration, artifact({
+      type: 'build-submission',
+      name: 'Build submission',
+      mimeType: 'text/markdown',
+      content,
+    }));
+
+    expect(calls.filter((call) => call.url.pathname.includes('/contents/')).map((call) => call.method))
+      .toEqual(['GET', 'POST', 'GET']);
   });
 
   it.each([

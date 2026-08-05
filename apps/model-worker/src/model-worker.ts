@@ -2,6 +2,7 @@ import {
   OLLAMA_INFERENCE_TASK_QUEUE,
   resolveModelConcurrency,
 } from '@orchestra/contracts';
+import { createTemporalDataConverter, ProjectStore } from '@orchestra/database';
 import { Client } from '@temporalio/client';
 import { NativeConnection, Worker, bundleWorkflowCode } from '@temporalio/worker';
 import {
@@ -22,7 +23,10 @@ const connection = await NativeConnection.connect({
   address: process.env.TEMPORAL_ADDRESS ?? 'localhost:7233',
 });
 const namespace = process.env.TEMPORAL_NAMESPACE ?? 'default';
-const client = new Client({ connection, namespace });
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) throw new Error('DATABASE_URL is required for Temporal payload references.');
+const dataConverter = createTemporalDataConverter(new ProjectStore(databaseUrl));
+const client = new Client({ connection, namespace, dataConverter });
 configureModelWorkflowClient(client);
 
 const mode = parseModelWorkerMode(process.env.MODEL_WORKER_MODE);
@@ -59,6 +63,7 @@ const workers = await Promise.all(plan.map((entry) => {
       namespace,
       taskQueue: entry.taskQueue,
       workflowBundle,
+      dataConverter,
     });
   }
   if (entry.kind === 'routing') {
@@ -67,6 +72,7 @@ const workers = await Promise.all(plan.map((entry) => {
       namespace,
       taskQueue: entry.taskQueue,
       activities: { resolveInferencePolicy },
+      dataConverter,
       maxConcurrentActivityTaskExecutions: 32,
     });
   }
@@ -78,6 +84,7 @@ const workers = await Promise.all(plan.map((entry) => {
       taskQueue: entry.taskQueue,
       workflowBundle,
       activities: { ollamaInference, ollamaProviderInference },
+      dataConverter,
       maxConcurrentActivityTaskExecutions: 1,
       maxConcurrentLocalActivityExecutions: 1,
     });
@@ -91,6 +98,7 @@ const workers = await Promise.all(plan.map((entry) => {
       taskQueue: entry.taskQueue,
       workflowBundle,
       activities: { openRouterInference },
+      dataConverter,
       maxConcurrentActivityTaskExecutions: concurrency,
       maxConcurrentLocalActivityExecutions: concurrency,
     });
@@ -100,6 +108,7 @@ const workers = await Promise.all(plan.map((entry) => {
     namespace,
     taskQueue: entry.taskQueue,
     activities: { runAgent },
+    dataConverter,
     maxConcurrentActivityTaskExecutions: 1,
     maxConcurrentLocalActivityExecutions: 1,
   });

@@ -1,6 +1,8 @@
 import { Injectable, NotFoundException, OnModuleDestroy } from '@nestjs/common';
 import {
   PROJECT_WORKFLOW_TASK_QUEUE,
+  organismAgentRoles,
+  type AgentRuntimeSnapshot,
   type AgentCommentInput,
   type AgentQuestionAnswerInput,
   type ArtifactFeedbackInput,
@@ -11,6 +13,7 @@ import {
   type ProjectSummary,
   type ReviewCheckpoint,
 } from '@orchestra/contracts';
+import { createPostgresTemporalDataConverter } from '@orchestra/database/temporal-payloads';
 import { Client, Connection, WorkflowNotFoundError } from '@temporalio/client';
 import { randomUUID } from 'node:crypto';
 
@@ -30,6 +33,11 @@ export interface ProjectTemporalGateway {
 @Injectable()
 export class TemporalGateway implements ProjectTemporalGateway, OnModuleDestroy {
   private connection?: Connection;
+  private readonly dataConverter = (() => {
+    const databaseUrl = process.env.DATABASE_URL;
+    if (!databaseUrl) throw new Error('DATABASE_URL is required for Temporal payload references.');
+    return createPostgresTemporalDataConverter(databaseUrl);
+  })();
 
   async createProject(brief: ProjectBrief): Promise<Project> {
     const client = await this.client();
@@ -65,7 +73,47 @@ export class TemporalGateway implements ProjectTemporalGateway, OnModuleDestroy 
         // Older workflow histories do not expose review checkpoints. They
         // remain visible, but the UI will not permit an unbound review.
       }
-      return { ...detail, reviewCheckpoint };
+      const runtimeResults = await Promise.allSettled(organismAgentRoles.map(async (role) => {
+        const status = await client.workflow.getHandle(`project/${id}/agent/${role}`).query<AgentRuntimeSnapshot>('getStatus');
+        return status;
+      }));
+      // Database snapshots are the durable fallback. A live actor query may be
+      // temporarily unavailable during startup, Continue-As-New, or a worker
+      // rollout; that must not make an otherwise-known role disappear from the
+      // organism. Fresh Temporal query results replace the stored projection
+      // role by role.
+      const runtimeByRole = new Map(
+        (detail.agentRuntimeSnapshots ?? []).map((snapshot) => [snapshot.role, snapshot]),
+      );
+      for (const result of runtimeResults) {
+        if (result.status === 'fulfilled') runtimeByRole.set(result.value.role, result.value);
+      }
+      const agentRuntimeSnapshots = organismAgentRoles.flatMap((role) => {
+        const snapshot = runtimeByRole.get(role);
+        return snapshot ? [snapshot] : [];
+      });
+      const executionGraph = detail.executionGraph
+        ? {
+            ...detail.executionGraph,
+            nodes: detail.executionGraph.nodes.map((node) => {
+              const runtime = runtimeByRole.get(node.role);
+              if (!runtime) return node;
+              const durableWait = node.state === 'waiting_on_human'
+                || node.state === 'blocked'
+                || node.state === 'completed_for_iteration';
+              return {
+                ...node,
+                state: durableWait ? node.state : runtime.state,
+                activity: durableWait ? node.activity : runtime.activity ?? node.activity,
+                stateChangedAt: durableWait ? node.stateChangedAt : runtime.stateChangedAt ?? node.stateChangedAt,
+                openMessageCount: Math.max(node.openMessageCount ?? 0, runtime.mailboxDepth),
+                blockingDependencyCount: Math.max(node.blockingDependencyCount ?? 0, runtime.blockerCount),
+                humanAttention: node.humanAttention || runtime.pendingQuestionCount > 0,
+              };
+            }),
+          }
+        : undefined;
+      return { ...detail, executionGraph, agentRuntimeSnapshots, reviewCheckpoint };
     } catch (error) {
       if (error instanceof WorkflowNotFoundError) throw new NotFoundException('Project not found');
       throw error;
@@ -111,7 +159,11 @@ export class TemporalGateway implements ProjectTemporalGateway, OnModuleDestroy 
 
   private async client() {
     this.connection ??= await Connection.connect({ address: process.env.TEMPORAL_ADDRESS ?? 'localhost:7233' });
-    return new Client({ connection: this.connection, namespace: process.env.TEMPORAL_NAMESPACE ?? 'default' });
+    return new Client({
+      connection: this.connection,
+      namespace: process.env.TEMPORAL_NAMESPACE ?? 'default',
+      dataConverter: this.dataConverter,
+    });
   }
 
   async onModuleDestroy() {

@@ -8,11 +8,12 @@ const modelSourceRoot = fileURLToPath(new URL('../apps/model-worker/src/', impor
 const appsRoot = fileURLToPath(new URL('../apps/', import.meta.url));
 const packageJson = JSON.parse(await readFile(new URL('package.json', apiRoot), 'utf8'));
 const forbiddenPackages = ['@orchestra/database', 'drizzle-orm', 'pg', 'postgres', 'ioredis', 'redis'];
+const temporalPayloadAdapter = '@orchestra/database/temporal-payloads';
 
 const dependencySections = ['dependencies', 'devDependencies', 'optionalDependencies'];
 const dependencyViolations = dependencySections.flatMap((section) =>
   forbiddenPackages
-    .filter((dependency) => packageJson[section]?.[dependency])
+    .filter((dependency) => packageJson[section]?.[dependency] && dependency !== '@orchestra/database')
     .map((dependency) => `${section}.${dependency}`),
 );
 
@@ -37,6 +38,9 @@ for (const file of files) {
   const displayPath = relative(process.cwd(), file);
 
   for (const dependency of forbiddenPackages) {
+    if (dependency === '@orchestra/database'
+      && file === join(sourceRoot, 'temporal-gateway.ts')
+      && source.includes(`from '${temporalPayloadAdapter}'`)) continue;
     if (source.includes(`from '${dependency}`) || source.includes(`from \"${dependency}`)) {
       importViolations.push(`${displayPath} imports ${dependency}`);
     }

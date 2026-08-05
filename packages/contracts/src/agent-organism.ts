@@ -1435,11 +1435,19 @@ export const agentActivationScenarios = agentScenarioDefinitions;
 export type AgentInteractionParty = AgentRole | 'human' | 'system' | 'project';
 export type AgentInteractionKind =
   | 'order'
+  | 'request'
+  | 'question'
+  | 'answer'
   | 'status'
   | 'handoff'
   | 'evidence'
   | 'finding'
   | 'decision'
+  | 'review'
+  | 'acknowledgement'
+  | 'blocker'
+  | 'revision_request'
+  | 'review_proposal'
   | 'control';
 export type AgentInteractionStatus =
   | 'pending'
@@ -1463,7 +1471,11 @@ export interface AgentInteraction {
   status: AgentInteractionStatus;
   createdAt: string;
   artifactRefs?: ArtifactReference[];
+  priority?: 'low' | 'normal' | 'high' | 'critical';
+  requiresAcknowledgement?: boolean;
+  deliveredAt?: string;
   live?: boolean;
+  dimensions?: Array<'artifact' | 'finding' | 'human' | 'model' | 'repository'>;
 }
 
 const agentInteractionPartySchema = z.union([
@@ -1478,11 +1490,76 @@ export const agentInteractionSchema = z.object({
   iterationNumber: z.number().int().positive(),
   from: agentInteractionPartySchema,
   to: z.array(agentInteractionPartySchema).min(1),
-  kind: z.enum(['order', 'status', 'handoff', 'evidence', 'finding', 'decision', 'control']),
+  kind: z.enum([
+    'order',
+    'request',
+    'question',
+    'answer',
+    'status',
+    'handoff',
+    'evidence',
+    'finding',
+    'decision',
+    'review',
+    'acknowledgement',
+    'blocker',
+    'revision_request',
+    'review_proposal',
+    'control',
+  ]),
   name: nonEmptyStringSchema,
   summary: nonEmptyStringSchema,
   status: z.enum(['pending', 'acknowledged', 'in_progress', 'completed', 'blocked', 'rejected']),
   createdAt: timestampSchema,
   artifactRefs: z.array(artifactReferenceSchema).optional(),
+  priority: z.enum(['low', 'normal', 'high', 'critical']).optional(),
+  requiresAcknowledgement: z.boolean().optional(),
+  deliveredAt: timestampSchema.optional(),
   live: z.boolean().optional(),
+  dimensions: z.array(z.enum(['artifact', 'finding', 'human', 'model', 'repository'])).optional(),
 });
+
+/**
+ * The canonical event vocabulary shared by workflows, persistence, and the UI.
+ * Payloads remain extensible, while identity, ordering, correlation, and actor
+ * attribution stay uniform across every event type.
+ */
+export const organismEventTypeSchema = z.enum([
+  'agent.registered',
+  'agent.state.changed',
+  'agent.activity.started',
+  'agent.activity.completed',
+  'message.sent',
+  'message.delivered',
+  'message.acknowledged',
+  'artifact.created',
+  'artifact.revised',
+  'finding.opened',
+  'finding.resolved',
+  'decision.recorded',
+  'human.feedback.received',
+  'question.answered',
+  'repository.revision.changed',
+  'test.completed',
+  'preview.deployed',
+  'policy.violation.detected',
+  'iteration.review.proposed',
+]);
+export type OrganismEventType = z.infer<typeof organismEventTypeSchema>;
+
+export const organismEventSchema = z.object({
+  schemaVersion: z.literal('1.0'),
+  eventId: nonEmptyStringSchema,
+  projectId: nonEmptyStringSchema,
+  iterationId: nonEmptyStringSchema.optional(),
+  sequence: z.number().int().positive(),
+  type: organismEventTypeSchema,
+  correlationId: nonEmptyStringSchema,
+  causationId: nonEmptyStringSchema.optional(),
+  actor: z.union([agentAddressSchema, activityAddressSchema, humanAddressSchema]),
+  subjectRole: organismAgentRoleSchema.optional(),
+  summary: nonEmptyStringSchema,
+  payload: z.record(z.string(), z.unknown()).default({}),
+  createdAt: timestampSchema,
+});
+export type OrganismEvent = z.infer<typeof organismEventSchema>;

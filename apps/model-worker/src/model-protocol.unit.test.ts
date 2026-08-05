@@ -1,12 +1,16 @@
 import type { AgentExecutionInput, AgentRole } from '@orchestra/contracts';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  buildAgentModelActionRequest,
   buildGenerationRequest,
   buildQualityReviewRequest,
+  completeAgentModelAction,
   executeModelInteraction,
+  finalizeAgentModelCandidate,
   formatInferenceFailure,
   parseAgentArtifact,
   parseModelQualityReview,
+  remainingModelInferenceDeadlineMs,
   type OllamaInferenceRequest,
   type OllamaInferenceResult,
 } from './model-protocol.js';
@@ -73,6 +77,103 @@ describe('formatInferenceFailure', () => {
 });
 
 describe('model interaction protocol', () => {
+  it('propagates one-call inference budgets through model actions', () => {
+    const inferenceBudget = {
+      maxTotalTokens: 12_000,
+      maxCost: 0.25,
+      deadlineEpochMs: 2_000_000,
+    };
+    expect(buildAgentModelActionRequest({
+      action: 'generate_candidate',
+      input: input('requirements'),
+      inferenceBudget,
+    })).toMatchObject({ purpose: 'generate', inferenceBudget });
+    expect(remainingModelInferenceDeadlineMs(inferenceBudget, 1_999_250)).toBe(750);
+  });
+
+  it('builds exactly one inference request for each one-shot model action', () => {
+    const artifactInput = input('requirements', 'requirements-baseline');
+    const review = { status: 'revise', rationale: 'Needs evidence.', findings: ['Add evidence.'] } as const;
+
+    expect(buildAgentModelActionRequest({
+      action: 'generate_candidate',
+      input: artifactInput,
+    })?.purpose).toBe('generate');
+    expect(buildAgentModelActionRequest({
+      action: 'quality_review',
+      input: artifactInput,
+      candidate: '{"content":"# Requirements"}',
+      round: 2,
+    })).toMatchObject({ purpose: 'quality_review', role: 'reviewer', round: 2 });
+    expect(buildAgentModelActionRequest({
+      action: 'revise_candidate',
+      input: artifactInput,
+      candidate: '{"content":"# Requirements"}',
+      review,
+      round: 3,
+    })).toMatchObject({ purpose: 'revise', role: 'requirements', round: 3 });
+    expect(buildAgentModelActionRequest({
+      action: 'finalize_candidate',
+      input: artifactInput,
+      candidate: result({ content: '# Requirements' }),
+      modelInvocations: [],
+    })).toBeUndefined();
+  });
+
+  it('parses one-shot review results and finalizes a recorded candidate without inference', () => {
+    const artifactInput = input('product', 'product-scope');
+    const reviewRequest = buildQualityReviewRequest(
+      artifactInput,
+      '{"content":"# Product scope"}',
+      1,
+    );
+    const reviewed = completeAgentModelAction(
+      'quality_review',
+      reviewRequest,
+      {
+        ...result({ status: 'pass', rationale: 'Complete.', findings: [] }, 'review-model'),
+        provider: 'openrouter',
+        requestId: 'review-1',
+      },
+    );
+    expect(reviewed).toMatchObject({
+      action: 'quality_review',
+      review: { status: 'pass', rationale: 'Complete.', findings: [] },
+      invocation: {
+        provider: 'openrouter',
+        model: 'review-model',
+        purpose: 'quality_review',
+        round: 1,
+        requestId: 'review-1',
+      },
+    });
+
+    const candidate = {
+      ...result({ content: '# Product scope', questions: [] }, 'product-model'),
+      provider: 'openrouter' as const,
+      requestId: 'candidate-1',
+    };
+    const invocation = {
+      provider: candidate.provider,
+      model: candidate.model,
+      purpose: 'generate' as const,
+      round: 0,
+      requestId: candidate.requestId,
+    };
+    expect(finalizeAgentModelCandidate({
+      action: 'finalize_candidate',
+      input: artifactInput,
+      candidate,
+      modelInvocations: [invocation],
+    })).toMatchObject({
+      type: 'product-scope',
+      content: '# Product scope',
+      model: 'product-model',
+      modelProvider: 'openrouter',
+      modelInvocations: [invocation],
+    });
+  });
+
   it('pins the Builder generation and review prompts to the shared preview runtime', () => {
     const builderInput = input('builder', 'build-submission');
     const generation = buildGenerationRequest(builderInput).messages[0]?.content;
@@ -84,7 +185,12 @@ describe('model interaction protocol', () => {
       expect(prompt).toContain('GET /health');
       expect(prompt).toContain('no secrets or companion services');
       expect(prompt).toContain('Docker HEALTHCHECK');
+      expect(prompt).toContain('lockfile');
     }
+    expect(generation).toContain('before accepting your handoff');
+    expect(generation).toContain('install, compile, test, startup, or health failure');
+    expect(buildGenerationRequest(builderInput).messages[1]?.content).toContain('Do not return package-lock.json');
+    expect(review).toContain('Reject every generated dependency lockfile');
   });
 
   it('teaches quality review the bounded root-level human-question contract', () => {
@@ -310,5 +416,16 @@ describe('model interaction protocol', () => {
       content: '# Build',
       files: [{ path: 'Dockerfile', content: 'FROM node:26-alpine\nEXPOSE 8080\nHEALTHCHECK CMD echo http://127.0.0.1:8080/health' }],
     }))).toThrow('real HEALTHCHECK for GET /health');
+    expect(() => parseAgentArtifact(input('builder'), result({
+      content: '# Build',
+      files: [{ path: 'Dockerfile', content: 'FROM node:26-alpine\nEXPOSE 8080\nHEALTHCHECK CMD wget -q --spider http://localhost:8080/health' }],
+    }))).toThrow('real HEALTHCHECK for GET /health');
+    expect(() => parseAgentArtifact(input('builder'), result({
+      content: '# Build',
+      files: [
+        { path: 'Dockerfile', content: previewDockerfile },
+        { path: 'package-lock.json', content: '{}' },
+      ],
+    }))).toThrow('must not model-generate dependency lockfile package-lock.json');
   });
 });

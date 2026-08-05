@@ -1,4 +1,5 @@
 import type { AgentRole, Project, ProjectArtifact, ProjectIteration } from '@orchestra/contracts';
+import { createHash } from 'node:crypto';
 
 interface ForgejoRepository { name: string; owner: { login: string }; html_url: string; private?: boolean }
 interface ForgejoIssue { number: number; html_url: string }
@@ -10,7 +11,8 @@ interface ForgejoPull {
 }
 interface ForgejoLabel { id: number; name: string; color: string }
 interface ForgejoProject { id: number; title: string }
-interface ForgejoContent { sha: string }
+interface ForgejoContent { sha: string; content?: string; encoding?: string }
+interface ForgejoIssueComment { body?: string }
 
 function forgejoConfig() {
   return {
@@ -24,7 +26,16 @@ function forgejoConfig() {
   };
 }
 
-async function rawRequest<T>(path: string, init: RequestInit = {}, allow: number[] = []): Promise<T | undefined> {
+interface ForgejoHttpResult<T> {
+  status: number;
+  data?: T;
+}
+
+async function rawRequestWithStatus<T>(
+  path: string,
+  init: RequestInit = {},
+  allow: number[] = [],
+): Promise<ForgejoHttpResult<T>> {
   const config = forgejoConfig();
   const response = await fetch(new URL(path, config.internalUrl), {
     ...init,
@@ -35,16 +46,27 @@ async function rawRequest<T>(path: string, init: RequestInit = {}, allow: number
     },
     signal: AbortSignal.timeout(30_000),
   });
-  if (allow.includes(response.status)) return undefined;
+  if (allow.includes(response.status)) return { status: response.status };
   const body = await response.text();
   if (!response.ok) throw new Error(`Forgejo ${init.method ?? 'GET'} ${path} returned ${response.status}: ${body.slice(0, 300)}`);
-  if (response.status === 204) return undefined;
-  if (!body.trim()) return undefined;
-  return JSON.parse(body) as T;
+  if (response.status === 204 || !body.trim()) return { status: response.status };
+  return { status: response.status, data: JSON.parse(body) as T };
+}
+
+async function rawRequest<T>(path: string, init: RequestInit = {}, allow: number[] = []): Promise<T | undefined> {
+  return (await rawRequestWithStatus<T>(path, init, allow)).data;
 }
 
 async function request<T>(path: string, init: RequestInit = {}, allow: number[] = []): Promise<T | undefined> {
   return rawRequest<T>(`/api/v1${path}`, init, allow);
+}
+
+async function requestWithStatus<T>(
+  path: string,
+  init: RequestInit = {},
+  allow: number[] = [],
+): Promise<ForgejoHttpResult<T>> {
+  return rawRequestWithStatus<T>(`/api/v1${path}`, init, allow);
 }
 
 export type ForgejoLifecyclePermission =
@@ -599,6 +621,39 @@ export async function addIterationComment(project: Project, iteration: ProjectIt
   });
 }
 
+export async function addIterationCommentOnce(
+  project: Project,
+  iteration: ProjectIteration,
+  body: string,
+  operationKey: string,
+): Promise<void> {
+  if (!iteration.issueNumber || !project.repositoryOwner || !project.repositoryName) return;
+  const path = `/repos/${project.repositoryOwner}/${project.repositoryName}/issues/${iteration.issueNumber}/comments`;
+  const marker = `<!-- orchestra-operation:${createHash('sha256').update(operationKey).digest('hex')} -->`;
+  const existing = await request<ForgejoIssueComment[]>(`${path}?limit=50`);
+  if (existing?.some((comment) => comment.body?.includes(marker))) return;
+  await request(path, {
+    method: 'POST',
+    body: JSON.stringify({ body: `${body}\n\n${marker}` }),
+  });
+}
+
+function gitBlobSha(content: Buffer): string {
+  return createHash('sha1')
+    .update(`blob ${content.byteLength}\0`)
+    .update(content)
+    .digest('hex');
+}
+
+function forgejoContentMatches(existing: ForgejoContent | undefined, content: string): boolean {
+  if (!existing) return false;
+  const expected = Buffer.from(content);
+  if (existing.content && (existing.encoding === undefined || existing.encoding === 'base64')) {
+    if (Buffer.from(existing.content.replaceAll(/\s/gu, ''), 'base64').equals(expected)) return true;
+  }
+  return existing.sha === gitBlobSha(expected);
+}
+
 export async function commitArtifact(project: Project, iteration: ProjectIteration, artifact: ProjectArtifact) {
   if (!project.repositoryOwner || !project.repositoryName) throw new Error('Project repository is not connected.');
   const branch = iteration.branchName ?? `iteration-${iteration.number}-agents`;
@@ -617,7 +672,14 @@ export async function commitArtifact(project: Project, iteration: ProjectIterati
   if (existing && (typeof existing.sha !== 'string' || !existing.sha)) {
     throw new Error(`Forgejo returned existing content without a SHA for ${path} on ${branch}.`);
   }
-  await request(contentPath, {
+  const config = forgejoConfig();
+  const location = {
+    path,
+    branch,
+    url: `${config.publicUrl}/${project.repositoryOwner}/${project.repositoryName}/src/branch/${branch}/${path}`,
+  };
+  if (forgejoContentMatches(existing, artifact.content)) return location;
+  const write = await requestWithStatus(contentPath, {
     method: existing ? 'PUT' : 'POST',
     body: JSON.stringify({
       branch,
@@ -627,13 +689,14 @@ export async function commitArtifact(project: Project, iteration: ProjectIterati
       committer: { name: 'Orchestra', email: 'agent@orchestra.local' },
       ...(existing ? { sha: existing.sha } : {}),
     }),
-  });
-  const config = forgejoConfig();
-  return {
-    path,
-    branch,
-    url: `${config.publicUrl}/${project.repositoryOwner}/${project.repositoryName}/src/branch/${branch}/${path}`,
-  };
+  }, [409, 422]);
+  if (write.status === 409 || write.status === 422) {
+    const concurrent = await request<ForgejoContent>(`${contentPath}?ref=${encodeURIComponent(branch)}`);
+    if (!forgejoContentMatches(concurrent, artifact.content)) {
+      throw new Error(`Forgejo reported a concurrent write conflict for ${path} on ${branch}.`);
+    }
+  }
+  return location;
 }
 
 export async function createIterationPullRequest(project: Project, iteration: ProjectIteration) {

@@ -17,7 +17,8 @@ RUN pnpm install --frozen-lockfile
 
 COPY apps/api apps/api
 COPY packages/contracts packages/contracts
-RUN pnpm --filter @orchestra/contracts build && pnpm --filter @orchestra/api build
+COPY packages/database packages/database
+RUN pnpm --filter @orchestra/contracts build && pnpm --filter @orchestra/database build && pnpm --filter @orchestra/api build
 RUN pnpm --filter @orchestra/api deploy --prod /deploy/api
 
 FROM node:26.5.0-bookworm-slim@sha256:2d49d876e96237d76de412761cf05dbfe5aee325cc4406a4d41d5824c5bb8beb

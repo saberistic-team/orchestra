@@ -16,7 +16,7 @@ Every iteration review records a value for every agent, including an intentional
 
 The living project team contains Manager, Requirements, Product, UX, Architecture, Data, Security, Planner, Builder, Test, Reviewer, Gate, Deployment, and Validation. They are durable roles with different authority, evidence obligations, and prohibitions—not merely different prompts or necessarily different models.
 
-The human-facing UI keeps their topology understandable: **Now** explains active work and safe handoffs; **Relationships** explains who a selected role may direct, consult, remediate, authorize, or report to. See [the agent organism](AGENT_ORGANISM.md) for the role and protocol model.
+The human-facing UI keeps the whole organization visible as a live graph. Agent nodes explain precise work and waiting states; message edges and topic threads show collaboration; a spotlight provides role detail without hiding the graph; and readiness separates the Manager's iteration-cutoff recommendation from mandatory Gate evidence. See [the agent organism](AGENT_ORGANISM.md) for the role and protocol model.
 
 ## Trust model
 

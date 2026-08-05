@@ -18,7 +18,7 @@ services:
         condition: service_started
       temporal:
         condition: service_started
-    ports: ["127.0.0.1:3000:3000"]
+    ports: ["127.0.0.1:${API_HOST_PORT:-3000}:3000"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
@@ -35,6 +35,8 @@ services:
       <<: *application-environment
       ORCHESTRA_WORKER_MODE: project
     depends_on:
+      postgres:
+        condition: service_healthy
       temporal:
         condition: service_started
     restart: unless-stopped
@@ -85,11 +87,14 @@ services:
       context: .
       dockerfile: apps/worker/Dockerfile
     environment:
+      DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
       ORCHESTRA_WORKER_MODE: agents
       AGENT_WORKER_ROLES: all
     depends_on:
+      postgres:
+        condition: service_healthy
       temporal:
         condition: service_started
     restart: unless-stopped
@@ -99,12 +104,15 @@ services:
       context: .
       dockerfile: apps/model-worker/Dockerfile
     environment:
+      DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
       MODEL_WORKER_MODE: brains
       MODEL_WORKER_ROLES: all
       MODEL_TASK_QUEUE: orchestra-models
     depends_on:
+      postgres:
+        condition: service_healthy
       temporal:
         condition: service_started
     restart: unless-stopped
@@ -114,6 +122,7 @@ services:
       context: .
       dockerfile: apps/model-worker/Dockerfile
     environment:
+      DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
       MODEL_WORKER_MODE: routing
@@ -163,6 +172,8 @@ services:
       OPENROUTER_MODEL_DEPLOYMENT: ${OPENROUTER_MODEL_DEPLOYMENT:-openai/gpt-oss-120b}
       OPENROUTER_MODEL_VALIDATION: ${OPENROUTER_MODEL_VALIDATION:-openai/gpt-5-mini}
     depends_on:
+      postgres:
+        condition: service_healthy
       temporal:
         condition: service_started
     restart: unless-stopped
@@ -172,15 +183,19 @@ services:
       context: .
       dockerfile: apps/model-worker/Dockerfile
     environment:
+      DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
       MODEL_WORKER_MODE: ollama-inference
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
       OLLAMA_TIMEOUT_MS: ${OLLAMA_TIMEOUT_MS:-1500000}
-      MODEL_MAX_RESPONSE_BYTES: ${MODEL_MAX_RESPONSE_BYTES:-2000000}
+      MODEL_MAX_RESPONSE_BYTES: ${MODEL_MAX_RESPONSE_BYTES:-1000000}
+      MODEL_MAX_ARTIFACT_CONTEXT_BYTES: ${MODEL_MAX_ARTIFACT_CONTEXT_BYTES:-1500000}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
+      postgres:
+        condition: service_healthy
       temporal:
         condition: service_started
     restart: unless-stopped
@@ -190,6 +205,7 @@ services:
       context: .
       dockerfile: apps/model-worker/Dockerfile
     environment:
+      DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
       MODEL_WORKER_MODE: openrouter-inference
@@ -199,15 +215,20 @@ services:
       OPENROUTER_ALLOWED_MODELS: ${OPENROUTER_ALLOWED_MODELS:-}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       OPENROUTER_TIMEOUT_MS: ${OPENROUTER_TIMEOUT_MS:-}
-      OPENROUTER_IDLE_TIMEOUT_MS: ${OPENROUTER_IDLE_TIMEOUT_MS:-90000}
+      OPENROUTER_IDLE_TIMEOUT_MS: ${OPENROUTER_IDLE_TIMEOUT_MS:-}
       OPENROUTER_MAX_TOKENS: ${OPENROUTER_MAX_TOKENS:-}
+      OPENROUTER_RETRY_MAX_TOKENS: ${OPENROUTER_RETRY_MAX_TOKENS:-}
       OPENROUTER_REASONING_MAX_TOKENS: ${OPENROUTER_REASONING_MAX_TOKENS:-}
       OPENROUTER_HTTP_ATTEMPTS: ${OPENROUTER_HTTP_ATTEMPTS:-2}
       OPENROUTER_PROVIDER_SORT: ${OPENROUTER_PROVIDER_SORT:-}
-      MODEL_MAX_RESPONSE_BYTES: ${MODEL_MAX_RESPONSE_BYTES:-2000000}
+      MODEL_MAX_RESPONSE_BYTES: ${MODEL_MAX_RESPONSE_BYTES:-1000000}
+      MODEL_MAX_ARTIFACT_CONTEXT_BYTES: ${MODEL_MAX_ARTIFACT_CONTEXT_BYTES:-1500000}
+      OPENROUTER_MAX_STREAM_BYTES: ${OPENROUTER_MAX_STREAM_BYTES:-10000000}
       OPENROUTER_HTTP_REFERER: ${OPENROUTER_HTTP_REFERER:-}
       OPENROUTER_APP_TITLE: ${OPENROUTER_APP_TITLE:-Orchestra}
     depends_on:
+      postgres:
+        condition: service_healthy
       temporal:
         condition: service_started
     restart: unless-stopped
@@ -217,6 +238,7 @@ services:
       context: .
       dockerfile: apps/validation-worker/Dockerfile
     environment:
+      DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
       FORGEJO_URL: http://forgejo:3000
@@ -229,6 +251,8 @@ services:
       PREVIEW_GATEWAY_PUBLIC_ORIGIN: ${PREVIEW_GATEWAY_PUBLIC_ORIGIN:-http://localhost:3003}
       PREVIEW_GATEWAY_INTERNAL_ORIGIN: http://preview-gateway:3003
     depends_on:
+      postgres:
+        condition: service_healthy
       temporal:
         condition: service_started
       forgejo:
@@ -267,7 +291,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    ports: ["127.0.0.1:3002:3002"]
+    ports: ["127.0.0.1:${PREVIEW_MANAGER_HOST_PORT:-3002}:3002"]
     networks: [default]
     read_only: true
     tmpfs:
@@ -354,7 +378,6 @@ services:
     build:
       context: .
       dockerfile: infra/redis/Dockerfile
-    ports: ["127.0.0.1:6379:6379"]
     volumes: [redis-data:/data]
 
   temporal:
@@ -371,7 +394,7 @@ services:
       POSTGRES_PWD: orchestra
       POSTGRES_SEEDS: postgres
       DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development.yaml
-    ports: ["127.0.0.1:7233:7233"]
+    ports: ["127.0.0.1:${TEMPORAL_HOST_PORT:-7233}:7233"]
 
   temporal-ui:
     build:
@@ -401,7 +424,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    ports: ["127.0.0.1:3001:3000", "127.0.0.1:2222:2222"]
+    ports: ["127.0.0.1:${FORGEJO_HOST_PORT:-3001}:3000", "127.0.0.1:2222:2222"]
     volumes: [forgejo-data:/var/lib/gitea]
 
   forgejo-bootstrap:

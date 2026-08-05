@@ -14,7 +14,8 @@ COPY packages/database/package.json packages/database/package.json
 RUN pnpm install --frozen-lockfile
 COPY apps/validation-worker apps/validation-worker
 COPY packages/contracts packages/contracts
-RUN pnpm --filter @orchestra/contracts build && pnpm --filter @orchestra/validation-worker build
+COPY packages/database packages/database
+RUN pnpm --filter @orchestra/contracts build && pnpm --filter @orchestra/database build && pnpm --filter @orchestra/validation-worker build
 RUN pnpm --filter @orchestra/validation-worker deploy --prod /deploy/validation-worker
 
 FROM mcr.microsoft.com/playwright:v1.62.1-noble@sha256:dcc5531e97840b9b5e794f2814476b21571c5124a3fca2267d73041f56e7580e
