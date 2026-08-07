@@ -1,4 +1,4 @@
-FROM node:26.5.0-bookworm-slim@sha256:2d49d876e96237d76de412761cf05dbfe5aee325cc4406a4d41d5824c5bb8beb AS build
+FROM node:26.5.1-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73 AS build
 
 RUN npm install --global pnpm@11.20.0
 WORKDIR /app
@@ -24,7 +24,7 @@ COPY packages/temporal-codec packages/temporal-codec
 RUN pnpm --filter @orchestra/contracts build && pnpm --filter @orchestra/database build && pnpm --filter @orchestra/temporal-codec build && pnpm --filter @orchestra/model-worker build
 RUN pnpm --filter @orchestra/model-worker deploy --prod /deploy/model-worker
 
-FROM node:26.5.0-bookworm-slim@sha256:2d49d876e96237d76de412761cf05dbfe5aee325cc4406a4d41d5824c5bb8beb
+FROM node:26.5.1-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73
 WORKDIR /app
 ENV NODE_ENV=production
 RUN npm uninstall --global npm
