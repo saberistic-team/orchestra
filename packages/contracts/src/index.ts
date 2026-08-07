@@ -1,11 +1,14 @@
 import { z } from 'zod';
 import { agentInteractionSchema, organismEventSchema } from './agent-organism.js';
+import type { ForgejoIssueAction } from './forgejo-work.js';
 import { previewAttestationSchema, previewImageDigestSchema, previewRevisionSchema, type PreviewDeploymentResult } from './preview.js';
 import { dynamicExecutionTraceSchema, type DynamicExecutionLimits, type DynamicExecutionTrace } from './dynamic-execution.js';
 
 export * from './agent-organism.js';
 export * from './dynamic-execution.js';
+export * from './forgejo-work.js';
 export * from './model-provider.js';
+export * from './packaging.js';
 export * from './preview.js';
 export * from './task-queues.js';
 
@@ -38,6 +41,7 @@ export const projectSchema = projectBriefSchema.extend({
   repositoryUrl: z.string().url().nullable().default(null),
   repositoryOwner: z.string().nullable().default(null),
   repositoryName: z.string().nullable().default(null),
+  forgejoProjectId: z.number().int().positive().nullable().optional(),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
 });
@@ -67,17 +71,17 @@ export interface DeliveryAgentDefinition {
 }
 
 export const deliveryAgentGraph = [
-  { role: 'manager', label: 'Manager', icon: '✦', phase: 'shape', artifactType: 'project-charter', artifactName: 'Project charter', projectStatus: 'defining', dependsOn: [], supervisedBy: [], consumes: ['project-intent'], produces: ['project-charter'] },
+  { role: 'manager', label: 'Manager', icon: '✦', phase: 'shape', artifactType: 'project-charter', artifactName: 'Project charter', projectStatus: 'defining', dependsOn: [], supervisedBy: [], consumes: ['project-intent'], produces: ['project-charter', 'work-packages'] },
   { role: 'requirements', label: 'Requirements', icon: '≡', phase: 'shape', artifactType: 'requirements-baseline', artifactName: 'Requirements baseline', projectStatus: 'defining', dependsOn: ['manager'], supervisedBy: ['manager'], consumes: ['project-intent', 'project-charter'], produces: ['requirements-baseline'] },
   { role: 'product', label: 'Product', icon: '◎', phase: 'shape', artifactType: 'product-scope', artifactName: 'Product scope', projectStatus: 'defining', dependsOn: ['manager'], supervisedBy: ['manager'], consumes: ['project-intent', 'project-charter'], produces: ['product-scope'] },
   { role: 'ux', label: 'UX', icon: '◇', phase: 'design', artifactType: 'user-journeys', artifactName: 'User journeys', projectStatus: 'planning', dependsOn: ['requirements', 'product'], supervisedBy: ['product'], consumes: ['requirements-baseline', 'product-scope'], produces: ['user-journeys', 'user-flow-diagram'] },
   { role: 'architecture', label: 'Architecture', icon: '⌘', phase: 'design', artifactType: 'solution-baseline', artifactName: 'Solution baseline', projectStatus: 'planning', dependsOn: ['requirements', 'product'], supervisedBy: ['manager'], consumes: ['requirements-baseline', 'product-scope'], produces: ['solution-baseline'] },
   { role: 'data', label: 'Data', icon: '▦', phase: 'design', artifactType: 'data-model', artifactName: 'Data model', projectStatus: 'planning', dependsOn: ['architecture'], supervisedBy: ['architecture'], consumes: ['requirements-baseline', 'solution-baseline'], produces: ['data-model'] },
   { role: 'security', label: 'Security', icon: '⛉', phase: 'design', artifactType: 'threat-model', artifactName: 'Threat model', projectStatus: 'planning', dependsOn: ['architecture', 'ux'], supervisedBy: ['architecture'], consumes: ['requirements-baseline', 'user-journeys', 'solution-baseline'], produces: ['threat-model'] },
-  { role: 'planner', label: 'Planner', icon: '↗', phase: 'plan', artifactType: 'iteration-plan', artifactName: 'Iteration plan', projectStatus: 'planning', dependsOn: ['ux', 'data', 'security'], supervisedBy: ['manager'], consumes: ['requirements-baseline', 'product-scope', 'user-journeys', 'solution-baseline', 'data-model', 'threat-model'], produces: ['iteration-plan'] },
-  { role: 'builder', label: 'Builder', icon: '⌨', phase: 'build', artifactType: 'build-submission', artifactName: 'Build submission', projectStatus: 'building', dependsOn: ['planner'], supervisedBy: ['planner', 'architecture'], consumes: ['iteration-plan', 'user-journeys', 'solution-baseline', 'data-model', 'threat-model'], produces: ['build-submission', 'source-file:*'] },
-  { role: 'test', label: 'Test', icon: '✓', phase: 'assure', artifactType: 'test-evidence', artifactName: 'Test evidence', projectStatus: 'reviewing', dependsOn: ['builder'], supervisedBy: ['planner'], consumes: ['requirements-baseline', 'threat-model', 'build-submission', 'source-file:*'], produces: ['test-evidence', 'user-flow-video'] },
-  { role: 'reviewer', label: 'Reviewer', icon: '◉', phase: 'assure', artifactType: 'review-decision', artifactName: 'Review decision', projectStatus: 'reviewing', dependsOn: ['builder'], supervisedBy: ['manager'], consumes: ['requirements-baseline', 'solution-baseline', 'build-submission', 'source-file:*'], produces: ['review-decision'] },
+  { role: 'planner', label: 'Planner', icon: '↗', phase: 'plan', artifactType: 'iteration-plan', artifactName: 'Iteration plan', projectStatus: 'planning', dependsOn: ['ux', 'data', 'security'], supervisedBy: ['manager'], consumes: ['requirements-baseline', 'product-scope', 'user-journeys', 'solution-baseline', 'data-model', 'threat-model'], produces: ['iteration-plan', 'packaging-plan'] },
+  { role: 'builder', label: 'Builder', icon: '⌨', phase: 'build', artifactType: 'build-submission', artifactName: 'Build submission', projectStatus: 'building', dependsOn: ['planner'], supervisedBy: ['planner', 'architecture'], consumes: ['iteration-plan', 'packaging-plan', 'user-journeys', 'solution-baseline', 'data-model', 'threat-model'], produces: ['build-submission', 'source-file:*', 'packaging-evidence'] },
+  { role: 'test', label: 'Test', icon: '✓', phase: 'assure', artifactType: 'test-evidence', artifactName: 'Test evidence', projectStatus: 'reviewing', dependsOn: ['builder'], supervisedBy: ['planner'], consumes: ['requirements-baseline', 'threat-model', 'build-submission', 'source-file:*', 'packaging-evidence'], produces: ['test-evidence', 'user-flow-video'] },
+  { role: 'reviewer', label: 'Reviewer', icon: '◉', phase: 'assure', artifactType: 'review-decision', artifactName: 'Review decision', projectStatus: 'reviewing', dependsOn: ['builder'], supervisedBy: ['manager'], consumes: ['requirements-baseline', 'solution-baseline', 'build-submission', 'source-file:*', 'packaging-evidence'], produces: ['review-decision'] },
   { role: 'gate', label: 'Gate', icon: '◆', phase: 'assure', artifactType: 'gate-decision', artifactName: 'Gate decision', projectStatus: 'reviewing', dependsOn: ['test', 'reviewer', 'security'], supervisedBy: ['manager'], consumes: ['threat-model', 'test-evidence', 'review-decision'], produces: ['gate-decision'] },
   { role: 'deployment', label: 'Deployment', icon: '⇧', phase: 'assure', artifactType: 'release-plan', artifactName: 'Release plan', projectStatus: 'reviewing', dependsOn: ['gate'], supervisedBy: ['manager'], consumes: ['gate-decision', 'build-submission', 'data-model', 'threat-model', 'test-evidence'], produces: ['release-plan', 'deployment-evidence'], activation: 'authorized_release' },
   { role: 'validation', label: 'Validation', icon: '∴', phase: 'assure', artifactType: 'outcome-validation', artifactName: 'Outcome validation', projectStatus: 'reviewing', dependsOn: ['deployment'], supervisedBy: ['manager', 'product'], consumes: ['product-scope', 'requirements-baseline', 'user-journeys', 'deployment-evidence'], produces: ['outcome-validation'], activation: 'authorized_release' },
@@ -140,6 +144,7 @@ export const artifactSchema = z.object({
     usage: z.object({
       promptTokens: z.number().nonnegative().optional(),
       completionTokens: z.number().nonnegative().optional(),
+      reasoningTokens: z.number().nonnegative().optional(),
       totalTokens: z.number().nonnegative().optional(),
       cost: z.number().nonnegative().optional(),
     }).optional(),
@@ -851,12 +856,19 @@ export interface AgentArtifactDraft {
       | 'completion_assessment';
     round: number;
     requestId?: string;
-    usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number; cost?: number };
+    usage?: {
+      promptTokens?: number;
+      completionTokens?: number;
+      reasoningTokens?: number;
+      totalTokens?: number;
+      cost?: number;
+    };
   }>;
   attachments?: ArtifactAttachmentDraft[];
   questions?: AgentQuestionDraft[];
   gateDecision?: GateDecision;
   executionTrace?: DynamicExecutionTrace;
+  forgejoIssueActions?: ForgejoIssueAction[];
 }
 
 export interface AgentWorkflowInput extends AgentExecutionInput {

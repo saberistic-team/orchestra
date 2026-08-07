@@ -3,11 +3,32 @@ import {
   PREVIEW_CONTAINER_PORT,
   PREVIEW_CONTRACT_VERSION,
   PREVIEW_RUNTIME_CONTRACT,
+  type PackagingBuildChecksRequest,
+  type PackagingBuildChecksResult,
+  type PackagingCheckResult,
   type PreviewDeploymentRequest,
   type PreviewDeploymentResult,
 } from '@orchestra/contracts';
+import {
+  assemblePackagingEvidence,
+  packagingBuildChecksResult,
+  runContainerHealthCheck,
+  runDockerBuildCheck,
+  runUnitTestsCheck,
+} from './build-checks.js';
+import {
+  dockerStatus,
+  followBuildProgress,
+  previewContainerOptions,
+  previewImageTag,
+  removeDockerContainer,
+  safeDockerIdentifier,
+  waitForHealthyContainer,
+} from './docker-ops.js';
 import { ForgejoSourceClient } from './forgejo-source.js';
 import { previewPublicUrl, previewRouteName } from './preview-routing.js';
+
+export { previewContainerOptions } from './docker-ops.js';
 
 const PREVIEW_LABEL = 'orchestra.preview';
 const PROJECT_LABEL = 'orchestra.preview.project-id';
@@ -22,93 +43,16 @@ function positiveNumber(value: string | undefined, fallback: number) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function dockerStatus(error: unknown) {
-  return typeof error === 'object' && error !== null && 'statusCode' in error
-    ? Number((error as { statusCode?: unknown }).statusCode)
-    : undefined;
-}
-
 function safeIdentifier(value: string) {
-  return value.toLowerCase().replace(/[^a-z0-9_.-]+/gu, '-').replace(/^-+|-+$/gu, '').slice(0, 50);
+  return safeDockerIdentifier(value);
 }
 
 function containerPortKey() {
   return `${PREVIEW_CONTAINER_PORT}/tcp`;
 }
 
-export function previewContainerOptions(input: {
-  image: string;
-  name: string;
-  network: string;
-  routeAlias: string;
-  labels: Record<string, string>;
-}): Docker.ContainerCreateOptions {
-  const port = containerPortKey();
-  return {
-    name: input.name,
-    Image: input.image,
-    User: '65532:65532',
-    Env: [
-      `PORT=${PREVIEW_CONTAINER_PORT}`,
-      'HOST=0.0.0.0',
-      'NODE_ENV=production',
-      'HOME=/tmp',
-    ],
-    Labels: input.labels,
-    ExposedPorts: { [port]: {} },
-    NetworkingConfig: {
-      EndpointsConfig: { [input.network]: { Aliases: [input.routeAlias] } },
-    },
-    HostConfig: {
-      NetworkMode: input.network,
-      AutoRemove: false,
-      Privileged: false,
-      CapDrop: ['ALL'],
-      SecurityOpt: ['no-new-privileges:true'],
-      ReadonlyRootfs: true,
-      Tmpfs: { '/tmp': 'rw,noexec,nosuid,nodev,size=67108864,mode=1777' },
-      Memory: 512 * 1024 * 1024,
-      MemorySwap: 512 * 1024 * 1024,
-      NanoCpus: 1_000_000_000,
-      PidsLimit: 128,
-      ShmSize: 64 * 1024 * 1024,
-      Init: true,
-      RestartPolicy: { Name: 'no', MaximumRetryCount: 0 },
-      LogConfig: { Type: 'local', Config: { 'max-size': '10m', 'max-file': '1', compress: 'false' } },
-    },
-  };
-}
-
-async function followBuild(docker: Docker, stream: NodeJS.ReadableStream) {
-  type BuildOutput = { error?: string; errorDetail?: { message?: string } };
-  type BuildProgress = { stream?: string; status?: string; id?: string };
-  const buildkitAwareDocker = docker as Docker & {
-    followProgress(
-      source: NodeJS.ReadableStream,
-      finished: (error: Error | null, output: BuildOutput[]) => void,
-      progress?: (entry: BuildProgress) => void,
-    ): void;
-  };
-  return new Promise<void>((resolve, reject) => {
-    buildkitAwareDocker.followProgress(stream, (error: Error | null, output: BuildOutput[]) => {
-      if (error) return reject(error);
-      const embedded = output?.find((entry) => entry.errorDetail?.message || entry.error);
-      if (embedded) return reject(new Error((embedded.errorDetail?.message ?? embedded.error ?? 'Docker build failed.').slice(0, 2_000)));
-      resolve();
-    }, (entry: BuildProgress) => {
-      const update = (entry.stream ?? entry.status ?? '').replace(/[\u0000-\u001f\u007f]+/gu, ' ').trim();
-      if (update) console.info(`[preview-build] ${entry.id ? `${entry.id}: ` : ''}${update.slice(0, 500)}`);
-    });
-  });
-}
-
-async function removeContainer(docker: Docker, id: string) {
-  try {
-    await docker.getContainer(id).remove({ force: true, v: true });
-  } catch (error) {
-    if (dockerStatus(error) !== 404) throw error;
-  }
-}
+const followBuild = followBuildProgress;
+const removeContainer = removeDockerContainer;
 
 function urls(name: string, imageDigest: string) {
   const internalUrl = new URL(`http://${name}:${PREVIEW_CONTAINER_PORT}/`);
@@ -123,25 +67,6 @@ async function inspectReadyContainer(docker: Docker, id: string, network: string
   const routeAlias = previewRouteName(name, inspected.Image);
   if (!inspected.NetworkSettings.Networks[network]?.Aliases?.includes(routeAlias)) return undefined;
   return { inspected, ...urls(name, inspected.Image) };
-}
-
-async function waitForHealthyContainer(docker: Docker, id: string, timeoutMs: number) {
-  const deadline = Date.now() + timeoutMs;
-  let last = 'starting';
-  while (Date.now() < deadline) {
-    const inspected = await docker.getContainer(id).inspect();
-    if (!inspected.State.Running) {
-      throw new Error(`Preview container stopped with exit code ${inspected.State.ExitCode}.`);
-    }
-    last = inspected.State.Health?.Status ?? 'missing';
-    if (last === 'unhealthy') {
-      const detail = inspected.State.Health?.Log.at(-1)?.Output?.trim().slice(0, 1_000);
-      throw new Error(`Preview container health check failed.${detail ? ` ${detail}` : ''}`);
-    }
-    if (last === 'healthy') return;
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  throw new Error(`Preview container did not become healthy before the timeout (last status: ${last}).`);
 }
 
 export class DockerPreviewManager {
@@ -172,6 +97,86 @@ export class DockerPreviewManager {
     const operation = this.deployOnce(input).finally(() => this.deployments.delete(key));
     this.deployments.set(key, operation);
     return operation;
+  }
+
+  async runBuildChecks(input: PackagingBuildChecksRequest): Promise<PackagingBuildChecksResult> {
+    await this.ensureNetwork();
+    const source = await this.source.fetch(input.repository, input.revision);
+    const image = previewImageTag(input.projectId, source.revision);
+    const labels = {
+      [PREVIEW_LABEL]: 'true',
+      [PROJECT_LABEL]: input.projectId,
+      [ITERATION_LABEL]: input.iterationId,
+      [REVISION_LABEL]: source.revision,
+      [CONTEXT_DIGEST_LABEL]: source.contextDigest,
+      [EXPIRES_LABEL]: new Date(Date.now() + positiveNumber(process.env.PREVIEW_TTL_MS, 24 * 60 * 60 * 1_000)).toISOString(),
+      'orchestra.packaging': 'true',
+    };
+    const results: PackagingCheckResult[] = [];
+    let imageDigest: string | null = null;
+
+    for (const check of input.plan.checks) {
+      if (check.kind === 'docker_build') {
+        const built = await runDockerBuildCheck({ docker: this.docker, source, image, labels });
+        imageDigest = built.imageDigest;
+        results.push({ ...built.result, id: check.id, required: check.required });
+        if (built.result.status !== 'passed' && check.required) break;
+        continue;
+      }
+      if (check.kind === 'container_health') {
+        if (!imageDigest) {
+          results.push({
+            id: check.id,
+            kind: check.kind,
+            required: check.required,
+            status: 'failed',
+            summary: 'container_health requires a successful docker_build first.',
+            log: '',
+          });
+          if (check.required) break;
+          continue;
+        }
+        // Packaging health probes Docker HEALTHCHECK only; they must not use
+        // gateway-routable orchestra-preview-* names reserved for human previews.
+        const name = safeIdentifier(`orchestra-pkg-${input.projectId.slice(0, 8)}-${input.iterationNumber}-${source.revision.slice(0, 12)}`);
+        const health = await runContainerHealthCheck({
+          docker: this.docker,
+          image,
+          name,
+          network: this.network,
+          labels,
+          createContainer: previewContainerOptions,
+          routeAlias: name,
+        });
+        results.push({ ...health, id: check.id, required: check.required });
+        if (health.status !== 'passed' && check.required) break;
+        continue;
+      }
+      if (check.kind === 'unit_tests') {
+        const unit = await runUnitTestsCheck({ docker: this.docker, source, check });
+        results.push(unit);
+        if (unit.status !== 'passed' && check.required) break;
+      }
+    }
+
+    for (const check of input.plan.checks) {
+      if (!results.some((result) => result.id === check.id)) {
+        results.push({
+          id: check.id,
+          kind: check.kind,
+          required: check.required,
+          status: 'skipped',
+          summary: 'Skipped because an earlier required packaging check failed.',
+          log: '',
+        });
+      }
+    }
+
+    return packagingBuildChecksResult(assemblePackagingEvidence({
+      revision: source.revision,
+      imageDigest,
+      checks: results,
+    }));
   }
 
   private async ensureNetwork() {
@@ -255,7 +260,7 @@ export class DockerPreviewManager {
     await this.cleanupExpired();
     const source = await this.source.fetch(input.repository);
     const name = safeIdentifier(`orchestra-preview-${input.projectId.slice(0, 8)}-${input.iterationNumber}-${source.revision.slice(0, 12)}`);
-    const image = safeIdentifier(`orchestra-preview-${input.projectId.slice(0, 12)}`) + `:${source.revision.slice(0, 12)}`;
+    const image = previewImageTag(input.projectId, source.revision);
     const ttlMs = positiveNumber(process.env.PREVIEW_TTL_MS, 24 * 60 * 60 * 1_000);
     const expiresAt = new Date(Date.now() + ttlMs).toISOString();
     const labels = {
@@ -290,31 +295,36 @@ export class DockerPreviewManager {
     }
 
     await removeContainer(this.docker, name);
-    const buildTimeout = positiveNumber(process.env.PREVIEW_BUILD_TIMEOUT_MS, 10 * 60 * 1_000);
-    const abort = new AbortController();
-    const timer = setTimeout(() => abort.abort(new Error('Preview image build timed out.')), buildTimeout);
+    let imageInspection: Docker.ImageInspectInfo;
     try {
-      // dockerode supports Buffer build contexts at runtime (and sends Content-Length),
-      // although its public overload currently omits Buffer from the input union.
-      const stream = await this.docker.buildImage(source.context as unknown as NodeJS.ReadableStream, {
-        t: image,
-        dockerfile: 'Dockerfile',
-        pull: true,
-        rm: true,
-        forcerm: true,
-        memory: 2 * 1024 * 1024 * 1024,
-        memswap: 2 * 1024 * 1024 * 1024,
-        shmsize: 128 * 1024 * 1024,
-        networkmode: process.env.PREVIEW_BUILD_NETWORK_MODE === 'none' ? 'none' : 'default',
-        labels,
-        abortSignal: abort.signal,
-      });
-      await followBuild(this.docker, stream);
-    } finally {
-      clearTimeout(timer);
+      imageInspection = await this.docker.getImage(image).inspect();
+    } catch {
+      const buildTimeout = positiveNumber(process.env.PREVIEW_BUILD_TIMEOUT_MS, 10 * 60 * 1_000);
+      const abort = new AbortController();
+      const timer = setTimeout(() => abort.abort(new Error('Preview image build timed out.')), buildTimeout);
+      try {
+        // dockerode supports Buffer build contexts at runtime (and sends Content-Length),
+        // although its public overload currently omits Buffer from the input union.
+        const stream = await this.docker.buildImage(source.context as unknown as NodeJS.ReadableStream, {
+          t: image,
+          dockerfile: 'Dockerfile',
+          version: '2',
+          pull: true,
+          rm: true,
+          forcerm: true,
+          memory: 2 * 1024 * 1024 * 1024,
+          memswap: 2 * 1024 * 1024 * 1024,
+          shmsize: 128 * 1024 * 1024,
+          networkmode: process.env.PREVIEW_BUILD_NETWORK_MODE === 'none' ? 'none' : 'default',
+          labels,
+          abortSignal: abort.signal,
+        });
+        await followBuild(this.docker, stream);
+      } finally {
+        clearTimeout(timer);
+      }
+      imageInspection = await this.docker.getImage(image).inspect();
     }
-
-    const imageInspection = await this.docker.getImage(image).inspect();
     if (!/^sha256:[0-9a-f]{64}$/u.test(imageInspection.Id)) throw new Error('Docker returned no immutable preview image digest.');
     const exposed = Object.keys(imageInspection.Config.ExposedPorts ?? {});
     if (exposed.length !== 1 || exposed[0] !== containerPortKey()) {

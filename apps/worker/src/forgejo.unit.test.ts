@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Project, ProjectArtifact, ProjectIteration } from '@orchestra/contracts';
 import {
+  applyForgejoIssueActions,
   applyIterationReviewLifecycle,
   assertSafeGeneratedSourcePath,
   addIterationCommentOnce,
   commitArtifact,
+  commitPackagingWorkflow,
   createForgejoLifecycleAdapter,
+  defaultManagerWorkPackages,
+  ensureDeliveryProjectBoard,
   ensureProjectRepository,
   type ForgejoLifecyclePermission,
   type ForgejoTransport,
@@ -29,6 +33,7 @@ const project: Project = {
   repositoryUrl: 'https://forgejo.example/orchestra/orchestra',
   repositoryOwner: 'orchestra',
   repositoryName: 'orchestra',
+  forgejoProjectId: null,
   createdAt: now,
   updatedAt: now,
 };
@@ -307,7 +312,8 @@ describe('Forgejo iteration lifecycle', () => {
     const createdLabels = calls.filter((call) => call.path.endsWith('/labels') && call.method === 'POST');
 
     expect(result).toMatchObject({ status: 'completed' });
-    expect(createdLabels).toHaveLength(18);
+    // 4 iteration/review + 6 item/* status + 14 agent/* role labels
+    expect(createdLabels).toHaveLength(24);
   });
 });
 
@@ -441,6 +447,39 @@ describe('Forgejo artifact commits', () => {
     }))).rejects.toThrow('reserved-ci-workflows:write');
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it('commits the templated packaging workflow with the reserved CI grant', async () => {
+    const calls: Array<{ method: string; url: URL; body?: string }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+      calls.push({ method, url, body: typeof init?.body === 'string' ? init.body : undefined });
+      if (method === 'POST' && url.pathname.endsWith('/branches')) return new Response(null, { status: 409 });
+      if (method === 'GET' && url.pathname.includes('/contents/')) return new Response(null, { status: 404 });
+      if (method === 'POST' && url.pathname.includes('/contents/')) {
+        return new Response(JSON.stringify({ content: { path: '.forgejo/workflows/iteration-packaging.yml' } }), {
+          status: 201,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+    }));
+
+    const location = await commitPackagingWorkflow(project, iteration, {
+      contractVersion: 1,
+      checks: [
+        { id: 'docker-build', kind: 'docker_build', required: true },
+        { id: 'container-health', kind: 'container_health', required: true },
+      ],
+      acceptanceSummary: 'Image builds and health passes.',
+    });
+
+    expect(location.path).toBe('.forgejo/workflows/iteration-packaging.yml');
+    const contentCall = calls.find((call) => call.method === 'POST' && call.url.pathname.includes('/contents/'));
+    expect(contentCall?.url.pathname).toContain('.forgejo');
+    const body = JSON.parse(String(contentCall?.body));
+    expect(Buffer.from(body.content, 'base64').toString('utf8')).toContain('docker build -f Dockerfile');
+  });
 });
 
 describe('generated repository safety policy', () => {
@@ -515,5 +554,156 @@ describe('generated repository safety policy', () => {
     await ensureProjectRepository({ ...project, repositoryOwner: null, repositoryUrl: null, repositoryName: 'orchestra' });
 
     expect(requests.some((request) => request.method === 'PATCH' && request.body?.includes('"private":false'))).toBe(true);
+  });
+});
+
+describe('Forgejo delivery board and work issues', () => {
+  it('creates the delivery board once and tolerates missing column APIs', async () => {
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      calls.push(`${init.method ?? 'GET'} ${url.pathname}`);
+      if (url.pathname.endsWith('/projects') && (init.method ?? 'GET') === 'GET') {
+        return new Response(JSON.stringify([]), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (url.pathname.endsWith('/projects') && init.method === 'POST') {
+        return new Response(JSON.stringify({ id: 9, title: 'Orchestra delivery' }), {
+          status: 201,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.pathname.includes('/columns')) {
+        return new Response(null, { status: 404 });
+      }
+      return new Response(JSON.stringify([]), { status: 200, headers: { 'content-type': 'application/json' } });
+    }));
+
+    const board = await ensureDeliveryProjectBoard(project);
+    expect(board.projectId).toBe(9);
+    expect(board.columnsSupported).toBe(false);
+    expect(calls.some((call) => call.startsWith('POST /api/v1/repos/orchestra/orchestra/projects'))).toBe(true);
+  });
+
+  it('treats a missing projects REST API as unsupported instead of failing', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('404 page not found\n', { status: 404 })));
+
+    const board = await ensureDeliveryProjectBoard(project);
+    expect(board).toEqual({ projectId: null, columnsSupported: false, columns: {} });
+  });
+
+  it('applies createIssue and completeIssue actions and tracks collaborator calls', async () => {
+    let issueCounter = 20;
+    const authorizations: string[] = [];
+    const labels = new Map<string, number>([
+      ['item/ready', 1],
+      ['item/in-progress', 2],
+      ['item/done', 3],
+      ['item/split', 4],
+      ['agent/planner', 5],
+      ['agent/builder', 6],
+      ['agent/architecture', 7],
+    ]);
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      const method = init.method ?? 'GET';
+      const authorization = String((init.headers as Record<string, string> | undefined)?.authorization ?? '');
+      authorizations.push(authorization);
+      if (url.pathname.endsWith('/labels') && method === 'GET') {
+        return new Response(JSON.stringify([...labels.entries()].map(([name, id]) => ({ id, name, color: '0969da' }))), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.pathname.endsWith('/issues') && method === 'POST') {
+        issueCounter += 1;
+        const body = JSON.parse(String(init.body)) as { title: string; body: string };
+        return new Response(JSON.stringify({
+          number: issueCounter,
+          html_url: `https://forgejo.example/orchestra/orchestra/issues/${issueCounter}`,
+          title: body.title,
+          body: body.body,
+          state: 'open',
+          labels: [{ name: 'agent/builder' }, { name: 'item/ready' }],
+        }), { status: 201, headers: { 'content-type': 'application/json' } });
+      }
+      if (url.pathname.includes('/comments') && method === 'POST') {
+        return new Response(JSON.stringify({ id: 1 }), { status: 201, headers: { 'content-type': 'application/json' } });
+      }
+      if (url.pathname.match(/\/issues\/\d+$/) && method === 'GET') {
+        const number = Number(url.pathname.split('/').at(-1));
+        return new Response(JSON.stringify({
+          number,
+          html_url: `https://forgejo.example/orchestra/orchestra/issues/${number}`,
+          title: 'Work',
+          body: 'Body',
+          state: 'open',
+          labels: number === 21 ? [{ name: 'agent/builder' }] : [],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (url.pathname.includes('/labels/') && method === 'DELETE') {
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname.endsWith('/labels') && method === 'POST') {
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({}), { status: 200, headers: { 'content-type': 'application/json' } });
+    }));
+
+    const applied = await applyForgejoIssueActions(project, iteration, 'planner', [
+      {
+        type: 'createIssue',
+        key: 'split-api',
+        title: 'Define API contract for intake',
+        body: 'Split architecture work into a concrete API contract Builder can implement safely.',
+        assigneeRoles: ['architecture', 'builder'],
+        parentIssueNumber: 12,
+      },
+      {
+        type: 'completeIssue',
+        issueNumber: 21,
+        comment: 'Planner finished framing this package.',
+      },
+    ]);
+
+    expect(applied.createdIssues).toEqual([{
+      number: 21,
+      title: 'Define API contract for intake',
+      key: 'split-api',
+      parentIssueNumber: 12,
+    }]);
+    expect(applied.calledRoles).toEqual(expect.arrayContaining(['architecture', 'builder']));
+    expect(applied.completedIssueNumbers).toEqual([21]);
+    expect(defaultManagerWorkPackages(project, iteration)).toHaveLength(3);
+    const plannerAuth = `Basic ${Buffer.from('orchestra-planner:orchestra-local-agent-change-me').toString('base64')}`;
+    expect(authorizations.some((value) => value === plannerAuth)).toBe(true);
+  });
+
+  it('adds every agent user as a write collaborator when ensuring a repository', async () => {
+    const collaboratorPuts: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      const method = init.method ?? 'GET';
+      if (method === 'GET' && url.pathname.includes('/repos/')) {
+        return new Response(JSON.stringify({
+          name: 'orchestra',
+          owner: { login: 'orchestra-agent' },
+          html_url: 'https://forgejo.example/orchestra-agent/orchestra',
+          private: false,
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (method === 'PUT' && url.pathname.includes('/collaborators/')) {
+        collaboratorPuts.push(url.pathname);
+        return new Response(null, { status: 204 });
+      }
+      return new Response(JSON.stringify({}), { status: 200, headers: { 'content-type': 'application/json' } });
+    }));
+
+    await ensureProjectRepository({ ...project, repositoryOwner: null, repositoryUrl: null, repositoryName: 'orchestra' });
+    expect(collaboratorPuts).toEqual(expect.arrayContaining([
+      '/api/v1/repos/orchestra-agent/orchestra/collaborators/orchestra-manager',
+      '/api/v1/repos/orchestra-agent/orchestra/collaborators/orchestra-builder',
+      '/api/v1/repos/orchestra-agent/orchestra/collaborators/orchestra-validation',
+    ]));
+    expect(collaboratorPuts).toHaveLength(14);
   });
 });

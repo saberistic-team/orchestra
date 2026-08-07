@@ -21,6 +21,26 @@ import {
   type OllamaInferenceRequest,
   type OllamaInferenceResult,
 } from './model-protocol.js';
+import {
+  budgetProgressDetails,
+  bumpOpenRouterBudgets,
+  clampOpenRouterBudgets,
+  estimatePromptTokens,
+  isCompleteJsonObject,
+  isLengthFinishReason,
+  resolveBudgetHardLimits,
+  resolveModelBudgetProfile,
+  shouldBumpOpenRouterBudget,
+  type OpenRouterBudgetState,
+} from './openrouter-budget.js';
+import {
+  applyLearnedStartingBudgets,
+  loadBudgetPrior,
+  openRouterBudgetHeadroom,
+  openRouterBudgetLearningEnabled,
+  recordSuccessfulBudgetPrior,
+  type OpenRouterBudgetPrior,
+} from './openrouter-budget-learning.js';
 
 let modelWorkflowClient: Client | undefined;
 let artifactStore: ProjectStore | undefined;
@@ -147,6 +167,10 @@ export interface OpenRouterRequestPolicy {
   maxTokens: number;
   retryMaxTokens: number;
   reasoningTokens: number;
+  hardMaxTokens: number;
+  hardReasoningTokens: number;
+  budgetBumps: number;
+  incrementRatio: number;
   timeoutMs: number;
   idleTimeoutMs: number;
   attempts: number;
@@ -230,31 +254,88 @@ function scopedValue(
     || environment[base]?.trim();
 }
 
+export interface ResolveOpenRouterRequestPolicyOptions {
+  observedPromptTokens?: number;
+  prior?: OpenRouterBudgetPrior | null;
+  sessionUsage?: ModelTokenUsage | null;
+}
+
 /** Per-role/per-purpose limits keep short decisions fast while preserving builder capacity. */
 export function resolveOpenRouterRequestPolicy(
   request: BoundInferenceRequest,
   environment: NodeJS.ProcessEnv = process.env,
+  observedPromptTokensOrOptions?: number | ResolveOpenRouterRequestPolicyOptions,
 ): OpenRouterRequestPolicy {
+  const options: ResolveOpenRouterRequestPolicyOptions = typeof observedPromptTokensOrOptions === 'number'
+    || observedPromptTokensOrOptions === undefined
+    ? { observedPromptTokens: observedPromptTokensOrOptions }
+    : observedPromptTokensOrOptions;
   const roleDefault = openRouterRoleDefaults[request.role];
-  const reviewReasoningTokens = request.model.startsWith('openai/gpt-5') ? 256 : 0;
+  const profile = resolveModelBudgetProfile(request.model);
+  const limits = resolveBudgetHardLimits(profile, environment);
+  const reviewReasoningTokens = profile.reasoningSupported && request.model.startsWith('openai/gpt-5')
+    ? 256
+    : 0;
   const purposeDefault = request.purpose === 'quality_review'
     ? { maxTokens: 2_048, retryMaxTokens: 4_096, reasoningTokens: reviewReasoningTokens, timeoutMs: 120_000 }
     : request.purpose === 'plan'
       ? { maxTokens: 3_072, retryMaxTokens: 4_096, reasoningTokens: 256, timeoutMs: 120_000 }
       : request.purpose === 'plan_repair'
         ? { maxTokens: 4_096, retryMaxTokens: 8_192, reasoningTokens: 256, timeoutMs: 120_000 }
-      : request.purpose === 'progress_assessment' || request.purpose === 'completion_assessment'
-        ? { maxTokens: 1_536, retryMaxTokens: 3_072, reasoningTokens: 256, timeoutMs: 120_000 }
-        : request.purpose === 'generate' || request.purpose === 'revise'
-          ? { ...roleDefault, retryMaxTokens: Math.max(roleDefault.maxTokens, 8_192) }
-          : { ...roleDefault, retryMaxTokens: roleDefault.maxTokens };
-  const configuredMaxTokens = positiveInteger(
-    scopedValue(environment, 'OPENROUTER_MAX_TOKENS', request),
-    purposeDefault.maxTokens,
+        : request.purpose === 'progress_assessment' || request.purpose === 'completion_assessment'
+          ? { maxTokens: 1_536, retryMaxTokens: 3_072, reasoningTokens: 256, timeoutMs: 120_000 }
+          : request.purpose === 'generate' || request.purpose === 'revise'
+            ? {
+              ...roleDefault,
+              reasoningTokens: profile.reasoningSupported ? roleDefault.reasoningTokens : 0,
+              retryMaxTokens: Math.max(roleDefault.maxTokens, 8_192),
+            }
+            : {
+              ...roleDefault,
+              reasoningTokens: profile.reasoningSupported ? roleDefault.reasoningTokens : 0,
+              retryMaxTokens: roleDefault.maxTokens,
+            };
+  const envMaxTokens = scopedValue(environment, 'OPENROUTER_MAX_TOKENS', request);
+  const envReasoningTokens = scopedValue(environment, 'OPENROUTER_REASONING_MAX_TOKENS', request);
+  const learned = !envMaxTokens && openRouterBudgetLearningEnabled(environment)
+    ? applyLearnedStartingBudgets({
+      floorMaxTokens: purposeDefault.maxTokens,
+      floorReasoningTokens: purposeDefault.reasoningTokens,
+      prior: options.prior,
+      sessionUsage: options.sessionUsage ?? request.priorUsage,
+      headroom: openRouterBudgetHeadroom(environment),
+    })
+    : {
+      maxTokens: purposeDefault.maxTokens,
+      reasoningTokens: purposeDefault.reasoningTokens,
+    };
+  // Explicit env overrides win as operator starts; otherwise use learned floors.
+  const requestedMaxTokens = positiveInteger(
+    envMaxTokens,
+    learned.maxTokens,
     131_072,
     'OpenRouter max tokens',
   );
-  const maxTokens = boundedCompletionTokens(request, configuredMaxTokens);
+  const requestedReasoningTokens = nonNegativeInteger(
+    envReasoningTokens,
+    envMaxTokens ? purposeDefault.reasoningTokens : learned.reasoningTokens,
+    65_536,
+    'OpenRouter reasoning max tokens',
+  );
+  const promptTokens = estimatePromptTokens(
+    request.messages,
+    options.observedPromptTokens ?? options.prior?.promptEwma,
+  );
+  const boundedRequestedMaxTokens = boundedCompletionTokens(request, requestedMaxTokens);
+  const boundedHardMaxTokens = boundedCompletionTokens(request, limits.hardMaxTokens);
+  const clamped = clampOpenRouterBudgets({
+    maxTokens: boundedRequestedMaxTokens,
+    reasoningTokens: requestedReasoningTokens,
+    profile,
+    hardMaxTokens: boundedHardMaxTokens,
+    hardReasoningTokens: limits.hardReasoningTokens,
+    promptTokens,
+  });
   const configuredRetryMaxTokens = positiveInteger(
     scopedValue(environment, 'OPENROUTER_RETRY_MAX_TOKENS', request),
     purposeDefault.retryMaxTokens,
@@ -263,15 +344,8 @@ export function resolveOpenRouterRequestPolicy(
   );
   const retryMaxTokens = boundedCompletionTokens(
     request,
-    Math.max(configuredMaxTokens, configuredRetryMaxTokens),
+    Math.max(boundedRequestedMaxTokens, configuredRetryMaxTokens),
   );
-  const configuredReasoningTokens = nonNegativeInteger(
-    scopedValue(environment, 'OPENROUTER_REASONING_MAX_TOKENS', request),
-    purposeDefault.reasoningTokens,
-    Math.max(0, configuredMaxTokens - 512),
-    'OpenRouter reasoning max tokens',
-  );
-  const reasoningTokens = Math.min(configuredReasoningTokens, Math.max(0, maxTokens - 1));
   const configuredTimeoutMs = positiveInteger(
     scopedValue(environment, 'OPENROUTER_TIMEOUT_MS', request)
       || environment.MODEL_TIMEOUT_MS?.trim(),
@@ -311,9 +385,13 @@ export function resolveOpenRouterRequestPolicy(
     throw new Error('OpenRouter provider sort must be latency or throughput.');
   }
   return {
-    maxTokens,
     retryMaxTokens,
-    reasoningTokens,
+    maxTokens: clamped.maxTokens,
+    reasoningTokens: clamped.reasoningTokens,
+    hardMaxTokens: boundedHardMaxTokens,
+    hardReasoningTokens: Math.min(limits.hardReasoningTokens, Math.max(0, boundedHardMaxTokens - 1)),
+    budgetBumps: limits.budgetBumps,
+    incrementRatio: limits.incrementRatio,
     timeoutMs,
     idleTimeoutMs,
     attempts,
@@ -545,12 +623,32 @@ function openRouterReasoning(reasoningTokens: number) {
 interface OpenRouterPayload {
   id?: string;
   model?: string;
-  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; cost?: number };
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    cost?: number;
+    completion_tokens_details?: { reasoning_tokens?: number };
+  };
   choices?: Array<{
     finish_reason?: string;
     native_finish_reason?: string;
     message?: { content?: string | Array<{ type?: string; text?: string }> };
   }>;
+}
+
+export function parseOpenRouterUsage(usage: OpenRouterPayload['usage']): ModelTokenUsage | undefined {
+  if (!usage) return undefined;
+  const reasoningTokens = usage.completion_tokens_details?.reasoning_tokens;
+  return {
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    reasoningTokens: typeof reasoningTokens === 'number' && Number.isFinite(reasoningTokens)
+      ? Math.max(0, reasoningTokens)
+      : undefined,
+    totalTokens: usage.total_tokens,
+    cost: usage.cost,
+  };
 }
 
 interface OpenRouterStreamChunk extends OpenRouterPayload {
@@ -812,6 +910,7 @@ function emptyOpenRouterResponseError(
   request: BoundInferenceRequest,
   payload: OpenRouterPayload,
   attempts: number,
+  budget?: Pick<OpenRouterBudgetState, 'maxTokens' | 'reasoningTokens'> & { budgetAttempt: number },
 ) {
   const choice = payload.choices?.[0];
   const metadata = [
@@ -820,9 +919,32 @@ function emptyOpenRouterResponseError(
     choice?.native_finish_reason ? `nativeFinishReason=${choice.native_finish_reason}` : undefined,
     payload.usage?.completion_tokens !== undefined ? `completionTokens=${payload.usage.completion_tokens}` : undefined,
     payload.usage?.total_tokens !== undefined ? `totalTokens=${payload.usage.total_tokens}` : undefined,
+    budget ? `budgetAttempt=${budget.budgetAttempt}` : undefined,
+    budget ? `maxTokens=${budget.maxTokens}` : undefined,
+    budget ? `reasoningTokens=${budget.reasoningTokens}` : undefined,
   ].filter(Boolean).join(', ');
   return new Error(
     `OpenRouter model ${request.model} returned no content for ${request.purpose} after ${attempts} attempts${metadata ? ` (${metadata})` : ''}.`,
+  );
+}
+
+function openRouterBudgetExhaustedError(
+  request: BoundInferenceRequest,
+  payload: OpenRouterPayload,
+  budget: Pick<OpenRouterBudgetState, 'maxTokens' | 'reasoningTokens' | 'hardMaxTokens'> & { budgetAttempt: number },
+) {
+  const choice = payload.choices?.[0];
+  const metadata = [
+    payload.id ? `requestId=${payload.id}` : undefined,
+    choice?.finish_reason ? `finishReason=${choice.finish_reason}` : undefined,
+    choice?.native_finish_reason ? `nativeFinishReason=${choice.native_finish_reason}` : undefined,
+    `budgetAttempt=${budget.budgetAttempt}`,
+    `maxTokens=${budget.maxTokens}`,
+    `hardMaxTokens=${budget.hardMaxTokens}`,
+    `reasoningTokens=${budget.reasoningTokens}`,
+  ].filter(Boolean).join(', ');
+  return new Error(
+    `OpenRouter model ${request.model} exhausted token budgets for ${request.purpose} (${metadata}).`,
   );
 }
 
@@ -836,7 +958,6 @@ async function inferWithOpenRouter(request: BoundInferenceRequest): Promise<Olla
   }
   assertOpenRouterPolicy(model);
   const url = openRouterUrl();
-  const policy = resolveOpenRouterRequestPolicy(request);
   const headers: Record<string, string> = {
     authorization: `Bearer ${apiKey}`,
   };
@@ -845,124 +966,173 @@ async function inferWithOpenRouter(request: BoundInferenceRequest): Promise<Olla
   if (referer) headers['http-referer'] = referer;
   if (title) headers['x-title'] = title;
 
+  const learnedPrior = await loadBudgetPrior(request, process.env);
+  let observedPromptTokens: number | undefined;
+  let policy = resolveOpenRouterRequestPolicy(request, process.env, {
+    observedPromptTokens,
+    prior: learnedPrior,
+    sessionUsage: request.priorUsage,
+  });
+  let budget: OpenRouterBudgetState = {
+    maxTokens: policy.maxTokens,
+    reasoningTokens: policy.reasoningTokens,
+    hardMaxTokens: policy.hardMaxTokens,
+    hardReasoningTokens: policy.hardReasoningTokens,
+    budgetBumps: policy.budgetBumps,
+    incrementRatio: policy.incrementRatio,
+  };
   let lastError: unknown;
   const cumulativeUsage = {
     promptTokens: 0,
     completionTokens: 0,
+    reasoningTokens: 0,
     totalTokens: 0,
     cost: 0,
   };
-  let escalateOutputLimit = false;
-  const recordBudgetedUsage = (usage: OpenRouterPayload['usage']) => {
+  const recordBudgetedUsage = (usage: ModelTokenUsage | undefined) => {
     if (!request.inferenceBudget) return;
-    if (!usage
-      || usage.prompt_tokens === undefined
-      || usage.completion_tokens === undefined
+    if (usage?.promptTokens === undefined
+      || usage.completionTokens === undefined
       || usage.cost === undefined) {
       throw new Error('OpenRouter retry usage was unavailable; the remaining inference budget cannot be enforced.');
     }
-    const totalTokens = usage.total_tokens ?? usage.prompt_tokens + usage.completion_tokens;
-    cumulativeUsage.promptTokens += usage.prompt_tokens;
-    cumulativeUsage.completionTokens += usage.completion_tokens;
-    cumulativeUsage.totalTokens += totalTokens;
+    cumulativeUsage.promptTokens += usage.promptTokens;
+    cumulativeUsage.completionTokens += usage.completionTokens;
+    cumulativeUsage.reasoningTokens += usage.reasoningTokens ?? 0;
+    cumulativeUsage.totalTokens += usage.totalTokens ?? usage.promptTokens + usage.completionTokens;
     cumulativeUsage.cost += usage.cost;
   };
-  for (let attempt = 1; attempt <= policy.attempts; attempt += 1) {
-    let attemptPolicy = policy;
-    if (attempt > 1) {
-      const remainingBudget = request.inferenceBudget ? {
-        ...request.inferenceBudget,
-        maxTotalTokens: request.inferenceBudget.maxTotalTokens - cumulativeUsage.totalTokens,
-        maxCost: request.inferenceBudget.maxCost - cumulativeUsage.cost,
-      } : undefined;
-      const retryRequest = remainingBudget ? { ...request, inferenceBudget: remainingBudget } : request;
-      const retryMaxTokens = boundedCompletionTokens(
-        retryRequest,
-        escalateOutputLimit ? policy.retryMaxTokens : policy.maxTokens,
-      );
-      const retryTimeoutMs = boundedDeadlineMs(remainingBudget, policy.timeoutMs);
-      attemptPolicy = {
-        ...policy,
-        maxTokens: retryMaxTokens,
-        reasoningTokens: Math.min(policy.reasoningTokens, Math.max(0, retryMaxTokens - 1)),
-        timeoutMs: retryTimeoutMs,
-        idleTimeoutMs: Math.min(policy.idleTimeoutMs, retryTimeoutMs),
-        provider: {
-          ...policy.provider,
-          ...(remainingBudget ? { max_price: boundedOpenRouterMaxPrice(remainingBudget) } : {}),
-        },
+
+  for (let budgetAttempt = 0; budgetAttempt <= budget.budgetBumps; budgetAttempt += 1) {
+    if (observedPromptTokens !== undefined) {
+      policy = resolveOpenRouterRequestPolicy(request, process.env, {
+        observedPromptTokens,
+        prior: learnedPrior,
+        sessionUsage: request.priorUsage,
+      });
+      const reclamped = clampOpenRouterBudgets({
+        maxTokens: budget.maxTokens,
+        reasoningTokens: budget.reasoningTokens,
+        profile: resolveModelBudgetProfile(request.model),
+        hardMaxTokens: policy.hardMaxTokens,
+        hardReasoningTokens: policy.hardReasoningTokens,
+        promptTokens: estimatePromptTokens(request.messages, observedPromptTokens),
+      });
+      budget = {
+        ...budget,
+        maxTokens: reclamped.maxTokens,
+        reasoningTokens: reclamped.reasoningTokens,
+        hardMaxTokens: policy.hardMaxTokens,
+        hardReasoningTokens: policy.hardReasoningTokens,
+        budgetBumps: policy.budgetBumps,
+        incrementRatio: policy.incrementRatio,
       };
     }
-    const reasoning = openRouterReasoning(attemptPolicy.reasoningTokens);
-    let response: Awaited<ReturnType<typeof postJson>>;
-    try {
-      response = await postOpenRouterStream(url, {
-        model,
-        temperature: request.temperature,
-        max_tokens: attemptPolicy.maxTokens,
-        reasoning,
-        provider: attemptPolicy.provider,
-        response_format: { type: 'json_object' },
-        stream: true,
-        stream_options: { include_usage: true },
-        messages: request.messages,
-      }, attemptPolicy, headers, request);
-    } catch (error) {
-      lastError = error;
-      if (error instanceof AmbiguousOpenRouterStreamError || attempt === policy.attempts) throw error;
-      await new Promise((resolve) => setTimeout(resolve, Math.min(5_000, 250 * (2 ** (attempt - 1)))));
-      continue;
-    }
+    reportOpenRouterProgress(budgetProgressDetails(request, budget, budgetAttempt));
+    const reasoning = openRouterReasoning(budget.reasoningTokens);
 
-    if ([429, 500, 502, 503, 504].includes(response.status) && attempt < policy.attempts) {
-      await new Promise((resolve) => setTimeout(resolve, retryDelayMs(response.headers, attempt)));
-      continue;
-    }
-    if (response.status < 200 || response.status >= 300) {
-      const detail = response.text.slice(0, 500);
-      throw new Error(`OpenRouter returned ${response.status} for model ${model}.${detail ? ` ${detail}` : ''}`);
-    }
+    for (let attempt = 1; attempt <= policy.attempts; attempt += 1) {
+      let response: Awaited<ReturnType<typeof postJson>>;
+      try {
+        response = await postOpenRouterStream(url, {
+          model,
+          temperature: request.temperature,
+          max_tokens: budget.maxTokens,
+          reasoning,
+          provider: policy.provider,
+          response_format: { type: 'json_object' },
+          stream: true,
+          stream_options: { include_usage: true },
+          messages: request.messages,
+        }, policy, headers, request);
+      } catch (error) {
+        lastError = error;
+        if (error instanceof AmbiguousOpenRouterStreamError || attempt === policy.attempts) throw error;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(5_000, 250 * (2 ** (attempt - 1)))));
+        continue;
+      }
 
-    let payload: OpenRouterPayload;
-    try {
-      payload = JSON.parse(response.text) as OpenRouterPayload;
-    } catch (error) {
-      lastError = new Error(`OpenRouter returned malformed JSON for ${request.purpose}.`, { cause: error });
-      // A successful provider response without parseable usage cannot be
-      // charged against a bounded retry envelope safely.
-      if (request.inferenceBudget || attempt === policy.attempts) throw lastError;
-      await new Promise((resolve) => setTimeout(resolve, retryDelayMs(response.headers, attempt)));
-      continue;
-    }
+      if ([429, 500, 502, 503, 504].includes(response.status) && attempt < policy.attempts) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs(response.headers, attempt)));
+        continue;
+      }
+      if (response.status < 200 || response.status >= 300) {
+        const detail = response.text.slice(0, 500);
+        throw new Error(`OpenRouter returned ${response.status} for model ${model}.${detail ? ` ${detail}` : ''}`);
+      }
 
-    recordBudgetedUsage(payload.usage);
+      let payload: OpenRouterPayload;
+      try {
+        payload = JSON.parse(response.text) as OpenRouterPayload;
+      } catch (error) {
+        lastError = new Error(`OpenRouter returned malformed JSON for ${request.purpose}.`, { cause: error });
+        if (attempt === policy.attempts) throw lastError;
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs(response.headers, attempt)));
+        continue;
+      }
 
-    const content = openRouterContent(payload);
-    if (!content?.trim()) {
-      lastError = emptyOpenRouterResponseError(request, payload, attempt);
-      if (attempt === policy.attempts) throw emptyOpenRouterResponseError(request, payload, policy.attempts);
+      if (payload.usage?.prompt_tokens !== undefined) {
+        observedPromptTokens = payload.usage.prompt_tokens;
+      }
+      const usage = parseOpenRouterUsage(payload.usage);
+      recordBudgetedUsage(usage);
+
+      const content = openRouterContent(payload);
       const choice = payload.choices?.[0];
-      escalateOutputLimit = choice?.finish_reason === 'length'
-        || choice?.native_finish_reason === 'max_tokens';
-      await new Promise((resolve) => setTimeout(resolve, retryDelayMs(response.headers, attempt)));
-      continue;
-    }
+      const needsBump = shouldBumpOpenRouterBudget({
+        content,
+        finishReason: choice?.finish_reason,
+        nativeFinishReason: choice?.native_finish_reason,
+      });
+      const completeJson = Boolean(content?.trim() && isCompleteJsonObject(content));
 
-    const usage: ModelTokenUsage | undefined = request.inferenceBudget
-      ? { ...cumulativeUsage }
-      : payload.usage ? {
-        promptTokens: payload.usage.prompt_tokens,
-        completionTokens: payload.usage.completion_tokens,
-        totalTokens: payload.usage.total_tokens,
-        cost: payload.usage.cost,
-      } : undefined;
-    return assertBoundedInferenceResult(request, {
-      provider: 'openrouter',
-      model: payload.model ?? model,
-      content,
-      requestId: payload.id,
-      usage,
-    });
+      if (needsBump) {
+        const bumpedBudget = budgetAttempt < budget.budgetBumps
+          ? bumpOpenRouterBudgets(budget)
+          : undefined;
+        const nextBudget = bumpedBudget && budgetAttempt === 0
+          ? { ...bumpedBudget, maxTokens: Math.min(bumpedBudget.maxTokens, policy.retryMaxTokens) }
+          : bumpedBudget;
+        if (nextBudget) {
+          lastError = completeJson || content?.trim()
+            ? openRouterBudgetExhaustedError(request, payload, { ...budget, budgetAttempt })
+            : emptyOpenRouterResponseError(request, payload, attempt, { ...budget, budgetAttempt });
+          budget = nextBudget;
+          break;
+        }
+        if (!content?.trim()) {
+          lastError = emptyOpenRouterResponseError(request, payload, attempt, { ...budget, budgetAttempt });
+          if (attempt === policy.attempts) {
+            throw emptyOpenRouterResponseError(request, payload, policy.attempts, { ...budget, budgetAttempt });
+          }
+          await new Promise((resolve) => setTimeout(resolve, retryDelayMs(response.headers, attempt)));
+          continue;
+        }
+        if (!completeJson) {
+          throw openRouterBudgetExhaustedError(request, payload, { ...budget, budgetAttempt });
+        }
+        // Length-bound but structurally complete JSON at the hard cap is usable.
+      } else if (!content?.trim()) {
+        lastError = emptyOpenRouterResponseError(request, payload, attempt, { ...budget, budgetAttempt });
+        if (attempt === policy.attempts) {
+          throw emptyOpenRouterResponseError(request, payload, policy.attempts, { ...budget, budgetAttempt });
+        }
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs(response.headers, attempt)));
+        continue;
+      }
+
+      const lengthBound = isLengthFinishReason(choice?.finish_reason, choice?.native_finish_reason);
+      if (!lengthBound && completeJson && usage) {
+        await recordSuccessfulBudgetPrior(request, usage, process.env);
+      }
+      return assertBoundedInferenceResult(request, {
+        provider: 'openrouter',
+        model: payload.model ?? model,
+        content: content!,
+        requestId: payload.id,
+        usage: request.inferenceBudget ? { ...cumulativeUsage } : usage,
+      });
+    }
   }
   throw lastError instanceof Error ? lastError : new Error('OpenRouter request failed.');
 }

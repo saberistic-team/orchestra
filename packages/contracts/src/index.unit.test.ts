@@ -132,6 +132,25 @@ describe('agent organism contract', () => {
       budgetSnapshot: { modelInvocationCount: 0, totalTokens: 0, openRouterCostUsd: 0 },
     });
   });
+
+  it('wires planner packaging-plan into builder packaging-evidence before assure roles', () => {
+    expect(deliveryAgentGraph.find((definition) => definition.role === 'planner'))
+      .toMatchObject({ produces: expect.arrayContaining(['iteration-plan', 'packaging-plan']) });
+    expect(deliveryAgentGraph.find((definition) => definition.role === 'builder'))
+      .toMatchObject({
+        consumes: expect.arrayContaining(['packaging-plan']),
+        produces: expect.arrayContaining(['packaging-evidence']),
+      });
+    expect(deliveryAgentGraph.find((definition) => definition.role === 'test'))
+      .toMatchObject({ consumes: expect.arrayContaining(['packaging-evidence']) });
+    expect(deliveryAgentGraph.find((definition) => definition.role === 'reviewer'))
+      .toMatchObject({ consumes: expect.arrayContaining(['packaging-evidence']) });
+  });
+
+  it('has manager produce initial Forgejo work packages', () => {
+    expect(deliveryAgentGraph.find((definition) => definition.role === 'manager'))
+      .toMatchObject({ produces: expect.arrayContaining(['project-charter', 'work-packages']) });
+  });
 });
 
 describe('human-in-the-loop contracts', () => {

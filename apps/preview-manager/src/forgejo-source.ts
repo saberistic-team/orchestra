@@ -242,12 +242,15 @@ export class ForgejoSourceClient {
     });
   }
 
-  async fetch(repository: PreviewRepositoryInput): Promise<SourceArchive> {
+  async fetch(repository: PreviewRepositoryInput, preferredRevision?: string): Promise<SourceArchive> {
     const repositoryPath = `/api/v1/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}`;
-    const branchResponse = await this.request(`${repositoryPath}/branches/${encodePath(repository.branch)}`);
-    if (!branchResponse.ok) throw new Error(`Forgejo branch lookup returned ${branchResponse.status}.`);
-    const branch = await branchResponse.json() as ForgejoBranch;
-    const revision = typeof branch.commit?.id === 'string' ? branch.commit.id.toLowerCase() : '';
+    let revision = preferredRevision?.toLowerCase() ?? '';
+    if (!GIT_REVISION.test(revision)) {
+      const branchResponse = await this.request(`${repositoryPath}/branches/${encodePath(repository.branch)}`);
+      if (!branchResponse.ok) throw new Error(`Forgejo branch lookup returned ${branchResponse.status}.`);
+      const branch = await branchResponse.json() as ForgejoBranch;
+      revision = typeof branch.commit?.id === 'string' ? branch.commit.id.toLowerCase() : '';
+    }
     if (!GIT_REVISION.test(revision)) throw new Error('Forgejo returned no immutable branch revision.');
 
     const archiveResponse = await this.request(`${repositoryPath}/archive/${revision}.tar.gz`);
@@ -261,11 +264,12 @@ export class ForgejoSourceClient {
       throw new Error(`Forgejo source archive could not be safely expanded: ${error instanceof Error ? error.message : String(error)}`);
     }
     const entries = await unpackArchive(expanded, this.maxContextBytes, this.maxFiles);
+    const paths = entries.map((entry) => entry.path);
     const context = await normalizedBuildContext(entries);
     // Evidence files are excluded before this digest, so later Test/Gate commits
     // do not make an otherwise identical runnable source tree look different.
     const contextDigest = createHash('sha256').update(context).digest('hex');
-    return { revision, context, contextDigest };
+    return { revision, context, contextDigest, paths };
   }
 }
 

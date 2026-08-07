@@ -1,0 +1,28 @@
+{
+  "name": "@orchestra/temporal-codec",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@temporalio/common": "^1.21.1",
+    "@temporalio/proto": "^1.21.1",
+    "pg": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@types/pg": "^8.20.3",
+    "typescript": "^7.0.2"
+  }
+}

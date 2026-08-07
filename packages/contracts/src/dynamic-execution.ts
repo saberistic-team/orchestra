@@ -160,6 +160,7 @@ export const dynamicActionObservationSchema = z.object({
   usage: z.object({
     promptTokens: z.number().int().nonnegative().optional(),
     completionTokens: z.number().int().nonnegative().optional(),
+    reasoningTokens: z.number().int().nonnegative().optional(),
     totalTokens: z.number().int().nonnegative().optional(),
     cost: z.number().nonnegative().optional(),
   }).strict().optional(),
@@ -191,6 +192,7 @@ export const dynamicExecutionModelInvocationSchema = z.object({
   usage: z.object({
     promptTokens: z.number().int().nonnegative().optional(),
     completionTokens: z.number().int().nonnegative().optional(),
+    reasoningTokens: z.number().int().nonnegative().optional(),
     totalTokens: z.number().int().nonnegative().optional(),
     cost: z.number().nonnegative().optional(),
   }).strict().optional(),

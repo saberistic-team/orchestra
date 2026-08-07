@@ -10,9 +10,11 @@ COPY apps/worker/package.json apps/worker/package.json
 COPY apps/model-worker/package.json apps/model-worker/package.json
 COPY apps/preview-manager/package.json apps/preview-manager/package.json
 COPY apps/validation-worker/package.json apps/validation-worker/package.json
+COPY apps/temporal-codec/package.json apps/temporal-codec/package.json
 COPY apps/web/package.json apps/web/package.json
 COPY packages/contracts/package.json packages/contracts/package.json
 COPY packages/database/package.json packages/database/package.json
+COPY packages/temporal-codec/package.json packages/temporal-codec/package.json
 RUN pnpm install --frozen-lockfile
 
 COPY apps/preview-manager apps/preview-manager

@@ -1,8 +1,13 @@
 import {
+  PACKAGING_CONTRACT_VERSION,
   PREVIEW_CONTRACT_VERSION,
   PREVIEW_RUNTIME_CONTRACT,
+  packagingBuildChecksRequestSchema,
+  packagingBuildChecksResultSchema,
   previewDeploymentRequestSchema,
   previewDeploymentResultSchema,
+  type PackagingBuildChecksResult,
+  type PackagingPlan,
   type PreviewDeploymentResult,
   type Project,
   type ProjectIteration,
@@ -33,6 +38,13 @@ export interface DeployIterationPreviewInput {
   project: Project;
   iteration: ProjectIteration;
   existingPreview?: ExistingIterationPreview;
+}
+
+export interface RunPackagingBuildChecksInput {
+  project: Project;
+  iteration: ProjectIteration;
+  plan: PackagingPlan;
+  revision?: string;
 }
 
 export type PreviewCaptureTarget = Pick<PreviewDeploymentResult, 'internalUrl' | 'revision'>;
@@ -219,6 +231,58 @@ export async function probePreviewHealth(
     throw new Error(`Preview gateway probe could not reach the browser-facing route: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (gatewayStatus < 200 || gatewayStatus >= 300) throw new Error(`Preview gateway probe returned ${gatewayStatus}.`);
+}
+
+/**
+ * Runs Planner-defined packaging checks in the isolated preview-manager sandbox.
+ * Returns structured evidence on both pass and fail so Builder can remediate.
+ */
+export async function runPackagingBuildChecks(input: RunPackagingBuildChecksInput): Promise<PackagingBuildChecksResult> {
+  const endpoint = process.env.PREVIEW_DEPLOY_WEBHOOK_URL?.trim();
+  if (!endpoint) throw new Error('Packaging checks are unavailable because PREVIEW_DEPLOY_WEBHOOK_URL is not configured.');
+  if (!input.project.repositoryOwner || !input.project.repositoryName || !input.project.repositoryUrl || !input.iteration.branchName) {
+    throw new Error('Packaging checks require a connected repository and iteration branch.');
+  }
+  const token = process.env.PREVIEW_DEPLOY_TOKEN?.trim();
+  if (!token) throw new Error('Packaging checks are unavailable because PREVIEW_DEPLOY_TOKEN is not configured.');
+  const buildChecksUrl = new URL(endpoint);
+  buildChecksUrl.pathname = buildChecksUrl.pathname.replace(/\/previews\/?$/u, '/build-checks');
+  if (!buildChecksUrl.pathname.endsWith('/build-checks')) {
+    buildChecksUrl.pathname = `${buildChecksUrl.pathname.replace(/\/$/u, '')}/build-checks`;
+  }
+  const request = packagingBuildChecksRequestSchema.parse({
+    contractVersion: PACKAGING_CONTRACT_VERSION,
+    projectId: input.project.id,
+    iterationId: input.iteration.id,
+    iterationNumber: input.iteration.number,
+    repository: {
+      owner: input.project.repositoryOwner,
+      name: input.project.repositoryName,
+      url: input.project.repositoryUrl,
+      branch: input.iteration.branchName,
+    },
+    runtime: PREVIEW_RUNTIME_CONTRACT,
+    plan: input.plan,
+    ...(input.revision ? { revision: input.revision } : {}),
+  });
+  const response = await fetch(buildChecksUrl, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(request),
+    signal: AbortSignal.timeout(Number(process.env.PREVIEW_DEPLOY_TIMEOUT_MS ?? 600_000)),
+  });
+  if (!response.ok) {
+    throw new Error(`Packaging build-checks adapter returned ${response.status}: ${(await response.text()).slice(0, 300)}`);
+  }
+  const parsed = packagingBuildChecksResultSchema.safeParse(await response.json());
+  if (!parsed.success) {
+    throw new Error(`Packaging build-checks adapter returned invalid evidence: ${parsed.error.issues.map((issue) => issue.path.join('.') || 'result').join(', ')}.`);
+  }
+  return parsed.data;
 }
 
 /**

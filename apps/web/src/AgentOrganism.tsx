@@ -1107,6 +1107,7 @@ export interface AgentModelUsageSummary {
   totalTokens: number;
   promptTokens: number;
   completionTokens: number;
+  reasoningTokens: number;
   openRouterRequests: number;
   openRouterCost: number;
   openRouterCostReported: boolean;
@@ -1122,6 +1123,7 @@ export function summarizeAgentModelUsage(
     totalTokens: 0,
     promptTokens: 0,
     completionTokens: 0,
+    reasoningTokens: 0,
     openRouterRequests: 0,
     openRouterCost: 0,
     openRouterCostReported: false,
@@ -1135,9 +1137,11 @@ export function summarizeAgentModelUsage(
       seen.add(identity);
       const promptTokens = invocation.usage?.promptTokens ?? 0;
       const completionTokens = invocation.usage?.completionTokens ?? 0;
+      const reasoningTokens = invocation.usage?.reasoningTokens ?? 0;
       summary.requests += 1;
       summary.promptTokens += promptTokens;
       summary.completionTokens += completionTokens;
+      summary.reasoningTokens += reasoningTokens;
       summary.totalTokens += invocation.usage?.totalTokens ?? promptTokens + completionTokens;
       if ((invocation.provider ?? artifact.modelProvider) === 'openrouter') {
         summary.openRouterRequests += 1;
@@ -1184,7 +1188,7 @@ function ModelUsageSummary({ usage }: { usage: AgentModelUsageSummary }) {
     <div className="organism-detail__usage-heading"><h4>Model usage</h4><span>Recorded so far</span></div>
     {usage.requests > 0 ? <>
       <div className="organism-detail__usage-grid">
-        <article><span>Tokens</span><strong>{usage.totalTokens.toLocaleString()}</strong><small>{usage.promptTokens.toLocaleString()} input · {usage.completionTokens.toLocaleString()} output</small></article>
+        <article><span>Tokens</span><strong>{usage.totalTokens.toLocaleString()}</strong><small>{usage.promptTokens.toLocaleString()} input · {usage.completionTokens.toLocaleString()} output{usage.reasoningTokens > 0 ? ` · ${usage.reasoningTokens.toLocaleString()} reasoning` : ''}</small></article>
         <article><span>Requests</span><strong>{usage.requests.toLocaleString()}</strong><small>Completed model calls</small></article>
         {usage.openRouterRequests > 0 ? <article className="organism-detail__usage-cost"><span>OpenRouter cost</span><strong>{usage.openRouterCostReported ? formatModelCost(usage.openRouterCost) : 'Not reported'}</strong><small>{usage.openRouterRequests.toLocaleString()} hosted request{usage.openRouterRequests === 1 ? '' : 's'}</small></article> : null}
       </div>
@@ -1405,7 +1409,7 @@ export function normalizeAgentState(
 function inferAgentState(event: ProjectEvent | undefined, hasArtifact: boolean): AgentExecutionState {
   if (hasArtifact) return 'completed_for_iteration';
   const text = `${event?.title ?? ''} ${event?.description ?? ''}`.toLowerCase();
-  if (/block|fail|cannot|needs attention/.test(text)) return 'blocked';
+  if (/block|fail|cannot|needs attention|packaging check failed|packaging checks failed/.test(text)) return 'blocked';
   if (/review|evaluat|compar/.test(text)) return 'reviewing';
   if (/plan|deciding next/.test(text)) return 'planning';
   if (/message|send|receiv|acknowledg/.test(text)) return 'communicating';
@@ -1983,7 +1987,7 @@ function eventInteractionKind(event: ProjectEvent, text: string): AgentInteracti
 function interactionStatusFromText(text: string): AgentInteraction['status'] {
   const normalized = text.toLowerCase();
   if (/reject|declin/.test(normalized)) return 'rejected';
-  if (/block|fail|cannot|needs attention/.test(normalized)) return 'blocked';
+  if (/block|fail|cannot|needs attention|packaging check failed|packaging checks failed/.test(normalized)) return 'blocked';
   if (/start|working|running|in progress/.test(normalized)) return 'in_progress';
   if (/acknowledge|accepted|received/.test(normalized)) return 'acknowledged';
   if (/pending|queued|waiting/.test(normalized)) return 'pending';

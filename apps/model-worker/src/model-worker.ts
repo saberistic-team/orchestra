@@ -2,7 +2,7 @@ import {
   OLLAMA_INFERENCE_TASK_QUEUE,
   resolveModelConcurrency,
 } from '@orchestra/contracts';
-import { createTemporalDataConverter, ProjectStore } from '@orchestra/database';
+import { createOrchestraDataConverter } from '@orchestra/temporal-codec';
 import { Client } from '@temporalio/client';
 import { NativeConnection, Worker, bundleWorkflowCode } from '@temporalio/worker';
 import {
@@ -19,14 +19,16 @@ import {
 } from './model-protocol.js';
 import { modelWorkerQueuePlan, parseModelWorkerMode } from './worker-topology.js';
 
+const dataConverterHandle = createOrchestraDataConverter();
 const connection = await NativeConnection.connect({
   address: process.env.TEMPORAL_ADDRESS ?? 'localhost:7233',
 });
 const namespace = process.env.TEMPORAL_NAMESPACE ?? 'default';
-const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl) throw new Error('DATABASE_URL is required for Temporal payload references.');
-const dataConverter = createTemporalDataConverter(new ProjectStore(databaseUrl));
-const client = new Client({ connection, namespace, dataConverter });
+const client = new Client({
+  connection,
+  namespace,
+  dataConverter: dataConverterHandle.dataConverter,
+});
 configureModelWorkflowClient(client);
 
 const mode = parseModelWorkerMode(process.env.MODEL_WORKER_MODE);
@@ -63,7 +65,7 @@ const workers = await Promise.all(plan.map((entry) => {
       namespace,
       taskQueue: entry.taskQueue,
       workflowBundle,
-      dataConverter,
+      dataConverter: dataConverterHandle.dataConverter,
     });
   }
   if (entry.kind === 'routing') {
@@ -72,7 +74,7 @@ const workers = await Promise.all(plan.map((entry) => {
       namespace,
       taskQueue: entry.taskQueue,
       activities: { resolveInferencePolicy },
-      dataConverter,
+      dataConverter: dataConverterHandle.dataConverter,
       maxConcurrentActivityTaskExecutions: 32,
     });
   }
@@ -84,7 +86,7 @@ const workers = await Promise.all(plan.map((entry) => {
       taskQueue: entry.taskQueue,
       workflowBundle,
       activities: { ollamaInference, ollamaProviderInference },
-      dataConverter,
+      dataConverter: dataConverterHandle.dataConverter,
       maxConcurrentActivityTaskExecutions: 1,
       maxConcurrentLocalActivityExecutions: 1,
     });
@@ -98,7 +100,7 @@ const workers = await Promise.all(plan.map((entry) => {
       taskQueue: entry.taskQueue,
       workflowBundle,
       activities: { openRouterInference },
-      dataConverter,
+      dataConverter: dataConverterHandle.dataConverter,
       maxConcurrentActivityTaskExecutions: concurrency,
       maxConcurrentLocalActivityExecutions: concurrency,
     });
@@ -108,7 +110,7 @@ const workers = await Promise.all(plan.map((entry) => {
     namespace,
     taskQueue: entry.taskQueue,
     activities: { runAgent },
-    dataConverter,
+    dataConverter: dataConverterHandle.dataConverter,
     maxConcurrentActivityTaskExecutions: 1,
     maxConcurrentLocalActivityExecutions: 1,
   });

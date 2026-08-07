@@ -1,4 +1,5 @@
 import type { AgentExecutionInput, AgentRole } from '@orchestra/contracts';
+import { DEFAULT_PACKAGING_PLAN, PACKAGING_CONTRACT_VERSION } from '@orchestra/contracts';
 import { describe, expect, it, vi } from 'vitest';
 import {
   buildAgentModelActionRequest,
@@ -8,9 +9,15 @@ import {
   executeModelInteraction,
   finalizeAgentModelCandidate,
   formatInferenceFailure,
-  parseAgentArtifact,
-  parseModelQualityReview,
-  remainingModelInferenceDeadlineMs,
+  formatPackagingSandboxResults,
+  normalizeAgentQuestionDraft,
+  normalizeForgejoIssueActionCandidate,
+  normalizeGateDecision,
+  normalizeWorkPackagesDocument,
+    parseAgentArtifact,
+    parseModelQualityReview,
+    remainingModelInferenceDeadlineMs,
+    parsePlannerPackagingPlan,
   type OllamaInferenceRequest,
   type OllamaInferenceResult,
 } from './model-protocol.js';
@@ -193,6 +200,56 @@ describe('model interaction protocol', () => {
     expect(review).toContain('Reject every generated dependency lockfile');
   });
 
+  it('requires Planner packagingPlan and defaults when omitted', () => {
+    const generation = buildGenerationRequest(input('planner', 'iteration-plan')).messages[0]?.content;
+    expect(generation).toContain('packagingPlan');
+    expect(generation).toContain('docker_build');
+    expect(parsePlannerPackagingPlan(undefined)).toMatchObject({
+      contractVersion: PACKAGING_CONTRACT_VERSION,
+      checks: DEFAULT_PACKAGING_PLAN.checks,
+    });
+    const artifact = parseAgentArtifact(input('planner', 'iteration-plan'), result({
+      content: '# Iteration plan\n\nShip a thin slice.',
+      packagingPlan: {
+        checks: [
+          { id: 'docker-build', kind: 'docker_build', required: true },
+          { id: 'container-health', kind: 'container_health', required: true },
+          { id: 'unit-tests', kind: 'unit_tests', required: true },
+        ],
+        acceptanceSummary: 'Image builds, health passes, and unit tests pass.',
+      },
+    }));
+    expect(artifact.attachments).toEqual([expect.objectContaining({
+      type: 'packaging-plan',
+      mimeType: 'application/json',
+    })]);
+    expect(JSON.parse(artifact.attachments![0]!.content).checks).toHaveLength(3);
+  });
+
+  it('formats packaging sandbox failures for Builder remediation prompts', () => {
+    const text = formatPackagingSandboxResults({
+      contractVersion: PACKAGING_CONTRACT_VERSION,
+      revision: 'a'.repeat(40),
+      imageDigest: null,
+      checks: [{
+        id: 'docker-build',
+        kind: 'docker_build',
+        required: true,
+        status: 'failed',
+        summary: 'Image build failed',
+        log: 'node:18-alpine: failed to resolve',
+      }],
+      passed: false,
+      attemptedAt: '2026-08-05T12:00:00.000Z',
+    }, DEFAULT_PACKAGING_PLAN);
+    expect(text).toContain('PACKAGING_SANDBOX_RESULTS');
+    expect(text).toContain('node:18-alpine');
+    expect(buildGenerationRequest({
+      ...input('builder', 'build-submission'),
+      context: `Approved context.\n\n${text}`,
+    }).messages[0]?.content).toContain('PACKAGING_SANDBOX_RESULTS');
+  });
+
   it('teaches quality review the bounded root-level human-question contract', () => {
     const request = buildQualityReviewRequest(input('requirements'), '{"content":"# Requirements","questions":[]}', 0);
     const review = request.messages[0]?.content;
@@ -200,7 +257,8 @@ describe('model interaction protocol', () => {
     expect(review).toContain('root-level JSON sibling of content');
     expect(review).toContain('Allow at most 3 questions');
     expect(review).toContain('exactly one decision per question');
-    expect(review).toContain('do not require it to be false');
+    expect(review).toContain('"decisionKey":"domain.choice"');
+    expect(review).toContain('Use question (never prompt)');
     expect(review).toContain('must not exceed 1600 words');
     expect(request.messages[1]?.content).toContain('<APPROVED_CONTEXT_AND_HUMAN_DIRECTION>');
     expect(request.messages[1]?.content).toContain('Approved project context.');
@@ -411,7 +469,7 @@ describe('model interaction protocol', () => {
     expect(() => parseAgentArtifact(input('builder'), result({
       content: '# Build',
       files: [{ path: 'Dockerfile', content: 'FROM node:26-alpine\nEXPOSE 8080\nCMD ["node", "server.js"]' }],
-    }))).toThrow('real HEALTHCHECK for GET /health');
+    }))).toThrow('real HEALTHCHECK for GET http://127.0.0.1:8080/health');
     expect(() => parseAgentArtifact(input('builder'), result({
       content: '# Build',
       files: [{ path: 'Dockerfile', content: 'FROM node:26-alpine\nEXPOSE 8080\nHEALTHCHECK CMD echo http://127.0.0.1:8080/health' }],
@@ -427,5 +485,225 @@ describe('model interaction protocol', () => {
         { path: 'package-lock.json', content: '{}' },
       ],
     }))).toThrow('must not model-generate dependency lockfile package-lock.json');
+  });
+
+  it('normalizes forgejoIssueActions action→type and skips manager createIssue when workPackages exist', () => {
+    expect(normalizeForgejoIssueActionCandidate({
+      action: 'createIssue',
+      title: 'Shape charter',
+      body: 'Write the first charter with clear acceptance criteria for review.',
+      assigneeRoles: ['manager', 'product'],
+      labels: ['agent/manager', 'item/backlog'],
+    })).toMatchObject({
+      type: 'createIssue',
+      key: 'shape-charter',
+    });
+    expect(normalizeForgejoIssueActionCandidate({
+      type: 'createIssue',
+      key: 'ux.audit-flow-design',
+      title: 'Design mobile audit input flow',
+      body: 'Design the primary audit screen with large touch targets for scanning and status toggles.',
+      assigneeRoles: ['ux'],
+    })).toMatchObject({
+      type: 'createIssue',
+      key: 'ux-audit-flow-design',
+    });
+    expect(normalizeForgejoIssueActionCandidate({
+      type: 'addLabels',
+      key: '#2',
+      labels: ['agent/architecture', 'agent/data', 'agent/security'],
+    })).toEqual({
+      type: 'addLabels',
+      issueNumber: 2,
+      labels: ['agent/architecture', 'agent/data', 'agent/security'],
+    });
+
+    const product = parseAgentArtifact(input('product', 'product-scope'), result({
+      content: '# Product scope',
+      forgejoIssueActions: [{
+        type: 'addLabels',
+        key: '#2',
+        labels: ['agent/architecture', 'agent/data', 'agent/security'],
+      }],
+    }));
+    expect(product.forgejoIssueActions).toEqual([{
+      type: 'addLabels',
+      issueNumber: 2,
+      labels: ['agent/architecture', 'agent/data', 'agent/security'],
+    }]);
+
+    const artifact = parseAgentArtifact(input('manager', 'project-charter'), result({
+      content: '# Charter',
+      workPackages: {
+        packages: [{
+          key: 'charter-shape',
+          title: 'Shape the first delivery charter',
+          body: 'Define intent, audience, success criteria, and the first bounded increment for review.',
+          assigneeRoles: ['manager', 'product'],
+        }],
+      },
+      forgejoIssueActions: [{
+        action: 'createIssue',
+        title: 'Duplicate charter issue',
+        body: 'This createIssue should be ignored because workPackages already define the issues.',
+        assigneeRoles: ['manager'],
+        labels: ['agent/manager'],
+      }],
+    }));
+    expect(artifact.attachments?.some((attachment) => attachment.type === 'work-packages')).toBe(true);
+    expect(artifact.forgejoIssueActions ?? []).toEqual([]);
+  });
+
+  it('normalizes Manager workPackages dotted keys and null parentKey before validation', () => {
+    expect(normalizeWorkPackagesDocument({
+      packages: [{
+        key: 'ux.audit-flow-design',
+        title: 'Mobile Audit UI Design',
+        body: 'Design low-cognitive-load inputs for floor staff during aisle audits.',
+        assigneeRoles: ['ux'],
+        parentKey: null,
+      }, {
+        key: 'arch.sync-strategy',
+        title: 'Offline Sync Architecture',
+        body: 'Define conflict resolution for offline edits under flaky Wi-Fi.',
+        assigneeRoles: ['architecture'],
+        parentKey: 'ux.audit-flow-design',
+      }],
+    })).toEqual({
+      packages: [{
+        key: 'ux-audit-flow-design',
+        title: 'Mobile Audit UI Design',
+        body: 'Design low-cognitive-load inputs for floor staff during aisle audits.',
+        assigneeRoles: ['ux'],
+      }, {
+        key: 'arch-sync-strategy',
+        title: 'Offline Sync Architecture',
+        body: 'Define conflict resolution for offline edits under flaky Wi-Fi.',
+        assigneeRoles: ['architecture'],
+        parentKey: 'ux-audit-flow-design',
+      }],
+    });
+
+    const artifact = parseAgentArtifact(input('manager', 'project-charter'), result({
+      content: '# ShelfPulse Iteration 1 Charter',
+      workPackages: {
+        packages: [{
+          key: 'ux.audit-flow-design',
+          title: 'Mobile Audit UI Design',
+          body: 'Design low-cognitive-load inputs for floor staff during aisle audits.',
+          assigneeRoles: ['ux'],
+          parentKey: null,
+        }],
+      },
+    }));
+    const workPackages = artifact.attachments?.find((attachment) => attachment.type === 'work-packages');
+    expect(workPackages).toBeDefined();
+    expect(JSON.parse(workPackages!.content)).toEqual({
+      packages: [{
+        key: 'ux-audit-flow-design',
+        title: 'Mobile Audit UI Design',
+        body: 'Design low-cognitive-load inputs for floor staff during aisle audits.',
+        assigneeRoles: ['ux'],
+      }],
+    });
+  });
+
+  it('documents Manager workPackages key and parentKey rules in generation and review prompts', () => {
+    const generation = buildGenerationRequest(input('manager', 'project-charter'));
+    expect(generation.messages[0]?.content).toContain('^[a-z][a-z0-9_-]*$');
+    expect(generation.messages[0]?.content).toContain('never emit parentKey:null');
+    expect(generation.messages[0]?.content).toContain('"workPackages":{"packages":');
+    expect(generation.messages[0]?.content).toContain('"issueNumber":2');
+
+    const review = buildQualityReviewRequest(
+      input('manager', 'project-charter'),
+      JSON.stringify({ content: '# Charter', workPackages: { packages: [] } }),
+      0,
+    );
+    expect(review.messages[0]?.content).toContain('no dots');
+    expect(review.messages[0]?.content).toContain('reject parentKey:null');
+  });
+
+  it('normalizes artifact questions, gate decisions, and createIssue parentIssueNumber drift', () => {
+    expect(normalizeAgentQuestionDraft({
+      decisionKey: 'decision:approve-charter',
+      prompt: 'Should the current charter be approved?',
+      options: [
+        { value: 'approve', label: 'Approve', key: 'opt-1' },
+        { value: 'revise', label: 'Revise', id: 'opt-2' },
+      ],
+      allowCustomAnswer: false,
+      allowAgentDecide: false,
+    })).toEqual({
+      decisionKey: 'decision.approve-charter',
+      question: 'Should the current charter be approved?',
+      options: [
+        { value: 'approve', label: 'Approve' },
+        { value: 'revise', label: 'Revise' },
+      ],
+      allowCustomAnswer: false,
+      allowAgentDecide: false,
+    });
+
+    expect(normalizeGateDecision({
+      status: 'Failed',
+      reason: 'Test evidence is missing.',
+      missing: ['test-evidence'],
+    })).toEqual({
+      status: 'blocked',
+      rationale: 'Test evidence is missing.',
+      missingEvidence: ['test-evidence'],
+    });
+
+    expect(normalizeForgejoIssueActionCandidate({
+      type: 'createIssue',
+      key: 'split.api',
+      title: 'Define API contract for intake',
+      body: 'Split the architecture work into a concrete API contract with acceptance criteria for Builder.',
+      assigneeRoles: ['architecture', 'builder'],
+      parentIssueNumber: '#3',
+    })).toMatchObject({
+      type: 'createIssue',
+      key: 'split-api',
+      parentIssueNumber: 3,
+    });
+
+    const requirements = parseAgentArtifact(input('requirements'), result({
+      content: '# Requirements baseline',
+      questions: [{
+        decisionKey: 'data:primary_identifier',
+        prompt: 'Which identifier should prevent duplicate check-ins?',
+        options: [
+          { value: 'phone', label: 'Owner phone', key: 'a' },
+          { value: 'patient_id', label: 'Clinic patient id' },
+        ],
+        allowCustomAnswer: true,
+        allowAgentDecide: false,
+      }],
+    }));
+    expect(requirements.questions).toEqual([{
+      decisionKey: 'data.primary_identifier',
+      question: 'Which identifier should prevent duplicate check-ins?',
+      options: [
+        { value: 'phone', label: 'Owner phone' },
+        { value: 'patient_id', label: 'Clinic patient id' },
+      ],
+      allowCustomAnswer: true,
+      allowAgentDecide: false,
+    }]);
+
+    const gate = parseAgentArtifact(input('gate', 'gate-decision'), result({
+      content: '# Gate decision',
+      gateDecision: {
+        status: 'blocked',
+        rationale: 'Test evidence is absent.',
+        missingEvidence: ['test-evidence'],
+      },
+    }));
+    expect(gate.gateDecision).toEqual({
+      status: 'blocked',
+      rationale: 'Test evidence is absent.',
+      missingEvidence: ['test-evidence'],
+    });
   });
 });

@@ -47,9 +47,9 @@ export const responsibilities = {
   security:
     'Threat-model the increment and identify permission, secret, dependency, prompt-injection, tool-abuse, and data-exfiltration controls.',
   planner:
-    'Create bounded, dependency-ordered work packages with acceptance criteria, expected artifacts, tests, risks, and permissions.',
+    'Create bounded, dependency-ordered work packages with acceptance criteria, expected artifacts, tests, risks, permissions, and a structured packaging-plan of allowlisted Forgejo packaging checks the Builder must pass before handoff.',
   builder:
-    'Describe a complete reproducible implementation submission, changed behavior, tests, evidence, limitations, and blockers. Never claim unprovided execution evidence.',
+    'Describe a complete reproducible implementation submission, changed behavior, tests, evidence, limitations, and blockers. Iterate with sandbox packaging checks until required checks pass. Never claim execution evidence that the packaging sandbox did not return.',
   test:
     'Create an independent validation plan covering unit, integration, contract, end-to-end, accessibility, security, and regression risks.',
   reviewer:

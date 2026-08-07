@@ -404,47 +404,6 @@ export class ProjectStore {
     await migrate(this.database, { migrationsFolder });
   }
 
-  async storeTemporalPayload(
-    digest: string,
-    dataBase64: string,
-    metadata: Record<string, string>,
-    byteLength: number,
-  ): Promise<void> {
-    const inserted = await this.database.insert(schema.temporalPayloadBlobs).values({
-      digest,
-      dataBase64,
-      metadata,
-      byteLength,
-    }).onConflictDoNothing().returning({ digest: schema.temporalPayloadBlobs.digest });
-    if (inserted.length > 0) return;
-    const [existing] = await this.database.select({
-      dataBase64: schema.temporalPayloadBlobs.dataBase64,
-      metadata: schema.temporalPayloadBlobs.metadata,
-      byteLength: schema.temporalPayloadBlobs.byteLength,
-    }).from(schema.temporalPayloadBlobs).where(eq(schema.temporalPayloadBlobs.digest, digest)).limit(1);
-    if (!existing
-      || existing.dataBase64 !== dataBase64
-      || existing.byteLength !== byteLength
-      || canonicalJson(existing.metadata) !== canonicalJson(metadata)) {
-      throw new Error(`Temporal payload digest collision or corrupt stored value: ${digest}`);
-    }
-  }
-
-  async loadTemporalPayloads(digests: string[]): Promise<Array<{
-    digest: string;
-    dataBase64: string;
-    metadata: Record<string, string>;
-    byteLength: number;
-  }>> {
-    if (digests.length === 0) return [];
-    return this.database.select({
-      digest: schema.temporalPayloadBlobs.digest,
-      dataBase64: schema.temporalPayloadBlobs.dataBase64,
-      metadata: schema.temporalPayloadBlobs.metadata,
-      byteLength: schema.temporalPayloadBlobs.byteLength,
-    }).from(schema.temporalPayloadBlobs).where(inArray(schema.temporalPayloadBlobs.digest, digests));
-  }
-
   async artifactContent(projectId: string, artifactId: string, version?: number): Promise<{
     content: string;
     version: number;
@@ -1521,6 +1480,55 @@ export class ProjectStore {
       return updated;
     });
     return this.toContract(row);
+  }
+
+  async setForgejoProjectId(projectId: string, forgejoProjectId: number): Promise<Project> {
+    const [row] = await this.database.update(schema.projects).set({
+      forgejoProjectId,
+      updatedAt: new Date(),
+    }).where(eq(schema.projects.id, projectId)).returning();
+    return this.toContract(row);
+  }
+
+  async recordIterationWorkIssue(input: {
+    projectId: string;
+    iterationId: string;
+    issueNumber: number;
+    packageKey?: string | null;
+    title: string;
+    createdByRole: AgentRole;
+    parentIssueNumber?: number | null;
+  }): Promise<void> {
+    await this.database.insert(schema.iterationWorkIssues).values({
+      projectId: input.projectId,
+      iterationId: input.iterationId,
+      issueNumber: input.issueNumber,
+      packageKey: input.packageKey ?? null,
+      title: input.title,
+      createdByRole: input.createdByRole,
+      parentIssueNumber: input.parentIssueNumber ?? null,
+    }).onConflictDoNothing({
+      target: [schema.iterationWorkIssues.iterationId, schema.iterationWorkIssues.issueNumber],
+    });
+  }
+
+  async listIterationWorkIssues(iterationId: string): Promise<Array<{
+    issueNumber: number;
+    packageKey: string | null;
+    title: string;
+    createdByRole: AgentRole;
+    parentIssueNumber: number | null;
+  }>> {
+    const rows = await this.database.select().from(schema.iterationWorkIssues)
+      .where(eq(schema.iterationWorkIssues.iterationId, iterationId))
+      .orderBy(schema.iterationWorkIssues.createdAt);
+    return rows.map((row) => ({
+      issueNumber: row.issueNumber,
+      packageKey: row.packageKey,
+      title: row.title,
+      createdByRole: row.createdByRole,
+      parentIssueNumber: row.parentIssueNumber,
+    }));
   }
 
   async updateIterationDelivery(iterationId: string, delivery: {
@@ -2759,7 +2767,12 @@ export class ProjectStore {
   }
 
   private toContract(row: typeof schema.projects.$inferSelect): Project {
-    return { ...row, createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString() };
+    return {
+      ...row,
+      forgejoProjectId: row.forgejoProjectId ?? null,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+    };
   }
 
   private toIteration(row: typeof schema.iterations.$inferSelect): ProjectIteration {
@@ -3226,6 +3239,7 @@ export {
   iterationAgentFeedback,
   iterationReviewProposals,
   iterationReviews,
+  iterationWorkIssues,
   iterations,
   messageThreads,
   modelInvocations,
@@ -3234,12 +3248,5 @@ export {
   projects,
   repositoryLifecycleRecords,
   repositoryOperations,
-  temporalPayloadBlobs,
+  temporalPayloads,
 } from './schema.js';
-
-export {
-  createTemporalDataConverter,
-  PostgresTemporalPayloadStorageDriver,
-  temporalPayloadShouldBeReferenced,
-  type TemporalPayloadBackend,
-} from './temporal-payload-storage.js';

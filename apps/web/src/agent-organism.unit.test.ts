@@ -208,10 +208,27 @@ describe('selected agent model usage', () => {
       totalTokens: 250,
       promptTokens: 180,
       completionTokens: 70,
+      reasoningTokens: 0,
       openRouterRequests: 1,
       openRouterCost: 0.0025,
       openRouterCostReported: true,
     });
+  });
+
+  it('includes reported reasoning tokens in the usage summary', () => {
+    const result = summarizeAgentModelUsage([
+      artifact({
+        modelProvider: 'openrouter',
+        modelInvocations: [{
+          provider: 'openrouter',
+          model: 'openai/gpt-5-mini',
+          purpose: 'generate',
+          round: 0,
+          usage: { promptTokens: 40, completionTokens: 120, reasoningTokens: 35, totalTokens: 160 },
+        }],
+      }),
+    ], 'manager', 'project-charter');
+    expect(result.reasoningTokens).toBe(35);
   });
 });
 

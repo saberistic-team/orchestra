@@ -10,6 +10,7 @@ services:
       REDIS_URL: redis://redis:6379
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
+      TEMPORAL_PAYLOAD_SIZE_THRESHOLD: ${TEMPORAL_PAYLOAD_SIZE_THRESHOLD:-262144}
       FORGEJO_URL: http://forgejo:3000
     depends_on:
       postgres:
@@ -67,6 +68,7 @@ services:
       FORGEJO_PUBLIC_URL: ${FORGEJO_PUBLIC_URL:-http://localhost:3001}
       FORGEJO_ADMIN_USER: ${FORGEJO_ADMIN_USER:-orchestra-agent}
       FORGEJO_ADMIN_PASSWORD: ${FORGEJO_ADMIN_PASSWORD:-orchestra-local-admin-change-me}
+      FORGEJO_AGENT_PASSWORD: ${FORGEJO_AGENT_PASSWORD:-orchestra-local-agent-change-me}
       FORGEJO_REPO_PRIVATE: ${FORGEJO_REPO_PRIVATE:-false}
       FORGEJO_LIFECYCLE_PERMISSIONS: ${FORGEJO_LIFECYCLE_PERMISSIONS:-pull_requests:comment,pull_requests:merge,issues:close,labels:write,projects:write,releases:write,packages:write,wiki:write}
     depends_on:
@@ -90,6 +92,7 @@ services:
       DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
+      TEMPORAL_PAYLOAD_SIZE_THRESHOLD: ${TEMPORAL_PAYLOAD_SIZE_THRESHOLD:-262144}
       ORCHESTRA_WORKER_MODE: agents
       AGENT_WORKER_ROLES: all
     depends_on:
@@ -107,6 +110,7 @@ services:
       DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
+      TEMPORAL_PAYLOAD_SIZE_THRESHOLD: ${TEMPORAL_PAYLOAD_SIZE_THRESHOLD:-262144}
       MODEL_WORKER_MODE: brains
       MODEL_WORKER_ROLES: all
       MODEL_TASK_QUEUE: orchestra-models
@@ -125,6 +129,7 @@ services:
       DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
+      TEMPORAL_PAYLOAD_SIZE_THRESHOLD: ${TEMPORAL_PAYLOAD_SIZE_THRESHOLD:-262144}
       MODEL_WORKER_MODE: routing
       MODEL_PROVIDER: ${MODEL_PROVIDER:-ollama}
       MODEL_PROVIDER_MANAGER: ${MODEL_PROVIDER_MANAGER:-}
@@ -186,6 +191,7 @@ services:
       DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
+      TEMPORAL_PAYLOAD_SIZE_THRESHOLD: ${TEMPORAL_PAYLOAD_SIZE_THRESHOLD:-262144}
       MODEL_WORKER_MODE: ollama-inference
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
       OLLAMA_TIMEOUT_MS: ${OLLAMA_TIMEOUT_MS:-1500000}
@@ -208,6 +214,8 @@ services:
       DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
+      REDIS_URL: redis://redis:6379
+      TEMPORAL_PAYLOAD_SIZE_THRESHOLD: ${TEMPORAL_PAYLOAD_SIZE_THRESHOLD:-262144}
       MODEL_WORKER_MODE: openrouter-inference
       MODEL_INFERENCE_CONCURRENCY: ${MODEL_INFERENCE_CONCURRENCY:-8}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
@@ -219,6 +227,12 @@ services:
       OPENROUTER_MAX_TOKENS: ${OPENROUTER_MAX_TOKENS:-}
       OPENROUTER_RETRY_MAX_TOKENS: ${OPENROUTER_RETRY_MAX_TOKENS:-}
       OPENROUTER_REASONING_MAX_TOKENS: ${OPENROUTER_REASONING_MAX_TOKENS:-}
+      OPENROUTER_MAX_TOKENS_HARD_LIMIT: ${OPENROUTER_MAX_TOKENS_HARD_LIMIT:-}
+      OPENROUTER_REASONING_MAX_TOKENS_HARD_LIMIT: ${OPENROUTER_REASONING_MAX_TOKENS_HARD_LIMIT:-}
+      OPENROUTER_BUDGET_BUMPS: ${OPENROUTER_BUDGET_BUMPS:-}
+      OPENROUTER_BUDGET_INCREMENT_RATIO: ${OPENROUTER_BUDGET_INCREMENT_RATIO:-}
+      OPENROUTER_BUDGET_LEARNING: ${OPENROUTER_BUDGET_LEARNING:-true}
+      OPENROUTER_BUDGET_HEADROOM: ${OPENROUTER_BUDGET_HEADROOM:-1.35}
       OPENROUTER_HTTP_ATTEMPTS: ${OPENROUTER_HTTP_ATTEMPTS:-2}
       OPENROUTER_PROVIDER_SORT: ${OPENROUTER_PROVIDER_SORT:-}
       MODEL_MAX_RESPONSE_BYTES: ${MODEL_MAX_RESPONSE_BYTES:-1000000}
@@ -229,6 +243,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_started
       temporal:
         condition: service_started
     restart: unless-stopped
@@ -241,6 +257,7 @@ services:
       DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: default
+      TEMPORAL_PAYLOAD_SIZE_THRESHOLD: ${TEMPORAL_PAYLOAD_SIZE_THRESHOLD:-262144}
       FORGEJO_URL: http://forgejo:3000
       FORGEJO_PUBLIC_URL: ${FORGEJO_PUBLIC_URL:-http://localhost:3001}
       FORGEJO_ADMIN_USER: ${FORGEJO_ADMIN_USER:-orchestra-agent}
@@ -396,13 +413,40 @@ services:
       DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development.yaml
     ports: ["127.0.0.1:${TEMPORAL_HOST_PORT:-7233}:7233"]
 
+  temporal-codec:
+    build:
+      context: .
+      dockerfile: apps/temporal-codec/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
+      TEMPORAL_CODEC_PORT: 8888
+      TEMPORAL_CODEC_CORS_ORIGINS: http://localhost:8080,http://127.0.0.1:8080
+      TEMPORAL_PAYLOAD_SIZE_THRESHOLD: ${TEMPORAL_PAYLOAD_SIZE_THRESHOLD:-262144}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports: ["127.0.0.1:8888:8888"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8888/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   temporal-ui:
     build:
       context: .
       dockerfile: infra/temporal-ui/Dockerfile
-    depends_on: [temporal]
+    depends_on:
+      temporal:
+        condition: service_started
+      temporal-codec:
+        condition: service_healthy
     environment:
       TEMPORAL_ADDRESS: temporal:7233
+      # Browser-side calls from the UI host, not the Compose network DNS name.
+      TEMPORAL_CODEC_ENDPOINT: http://localhost:8888
     ports: ["127.0.0.1:8080:8080"]
 
   forgejo:
@@ -441,6 +485,7 @@ services:
       FORGEJO_ADMIN_USER: ${FORGEJO_ADMIN_USER:-orchestra-agent}
       FORGEJO_ADMIN_PASSWORD: ${FORGEJO_ADMIN_PASSWORD:-orchestra-local-admin-change-me}
       FORGEJO_ADMIN_EMAIL: ${FORGEJO_ADMIN_EMAIL:-agent@orchestra.local}
+      FORGEJO_AGENT_PASSWORD: ${FORGEJO_AGENT_PASSWORD:-orchestra-local-agent-change-me}
     depends_on:
       forgejo:
         condition: service_healthy

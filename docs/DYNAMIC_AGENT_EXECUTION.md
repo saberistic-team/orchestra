@@ -113,6 +113,23 @@ As additional adapters are registered, repository, artifact, human, Forgejo, pre
 
 Capabilities are narrower than responsibilities. A Builder may be responsible for implementation without automatically receiving credential access, production deployment, protected-path writes, or approval authority. A plan cannot expand the grant attached to its order.
 
+## Model JSON contract (normalize before validate)
+
+Every model return that can fail closed must follow the same pipeline:
+
+1. **Prompt** with an exact nested JSON example for terminal shapes (plans, decisions, Forgejo actions, role attachments).
+2. **Normalize** common drift mechanically before Zod (aliases, flattened fields, null optionals, slug coercion).
+3. **Validate** with a strict schema; never accept partially parsed objects.
+4. **Repair or revise** with the validation issues; do not invent missing business content beyond documented aliases.
+5. **Quality-review** structured siblings when they are part of the role contract so finalize is not the first failure.
+
+Known normalizers today:
+
+- planning: `normalizeDecisionEnvelope`, `normalizeDecisionOptions`, fenced plan JSON, workflow-owned artifact transitions
+- artifacts: Manager `workPackages` key/`parentKey` coercion; Forgejo `issueNumber`/`parentIssueNumber` from `#N`/`key`; artifact `questions` prompt/colon/option drift; Gate status/rationale aliases; packaging check id/kind coercion; UX `userFlow` fail-closed shape check
+
+Generate, revise, and quality-review prompts include exact nested JSON examples for role siblings. When adding a new model-authored structure, ship the schema, a normalize helper, a prompt example, and a unit test for the observed drift in the same change.
+
 ## Plan validation and repair
 
 Before any action is scheduled, the interpreter validates the complete batch. It rejects a plan that:
@@ -147,9 +164,9 @@ An action failure is recorded as an observation. Independent actions may still f
 
 When a decision exceeds the role's authority, the model can return a structured `human_input_required` completion check with a stable decision key, understandable options, and explicit custom-answer or agent-decides permissions. The interpreter maps that request to the terminal execution state `waiting_for_human`, persists the question, and schedules no further work for that order.
 
-The accepted answer becomes durable project context. It is included in every later planning, repair, authoring, review, and completion call. On `waiting_for_human`, the current adapter records a checkpoint containing the candidate, observations, action identities, usage, limits, and elapsed budget. After the answer is persisted, the same logical execution resumes from that checkpoint with a newer context version and the decision identity in its required acknowledgements; it does not regenerate an already-recorded candidate or reset the order budget. A Temporal patch keeps older histories on their original restart behavior. Duplicate question Activities reuse their operation key. Choosing “let the agent decide” delegates only that recorded decision within the existing scope; it does not broaden repository, spending, credential, or deployment authority.
+The accepted answer becomes durable project context. It is included in every later planning, repair, authoring, review, and completion call. On `waiting_for_human`, the current adapter records a checkpoint containing the candidate, observations, action identities, usage, limits, and elapsed budget. After the answer is persisted, the same logical execution resumes from that checkpoint with a newer context version and the decision identity in its required acknowledgements; it does not regenerate an already-recorded candidate or reset the order budget. Duplicate question Activities reuse their operation key. Choosing “let the agent decide” delegates only that recorded decision within the existing scope; it does not broaden repository, spending, credential, or deployment authority.
 
-New project histories reconstruct guidance in stable-key pages of 50 records, scope artifact feedback to the producing role, and retain legacy one-shot loading for replay compatibility. Paging bounds each Activity response, but a full reload currently still enumerates the lifetime guidance ledger; durable guidance compaction or database-native effective-context pagination remains a scaling follow-up.
+New project histories reconstruct guidance in stable-key pages of 50 records and scope artifact feedback to the producing role. Paging bounds each Activity response, but a full reload currently still enumerates the lifetime guidance ledger; durable guidance compaction or database-native effective-context pagination remains a scaling follow-up.
 
 ## Budgets and loop termination
 
@@ -203,7 +220,7 @@ Planning, plan repair, artifact authoring, independent review, and revision use 
 
 Activity results, timers, signals, child results, and selected capability versions likewise come from workflow history during replay. Workflow code must not read mutable environment configuration, current repository state, wall-clock APIs, or provider state to recreate earlier choices.
 
-Persistent role actors do not Continue-As-New while an order or human question is active. Queue or interpreter changes use Temporal patch markers or a new workflow type. Legacy generate/review/revise histories remain on their compatibility path.
+Persistent role actors do not Continue-As-New while an order or human question is active. Queue or interpreter changes require a new workflow type or a clean Continue-As-New boundary rather than in-place history branching.
 
 The project coordinator continues as new only at clean review boundaries. Before rolling over, it durably drains human signals and Updates until their handlers are quiescent, merges any late targeted feedback into the next role-activation set, and carries the iteration, execution round, review sequence, retry version, bounded context, and reactive safety state. Stable role actors use `ABANDON` parent-close behavior and are not started again by the continued coordinator run.
 

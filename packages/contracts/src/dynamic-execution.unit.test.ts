@@ -45,7 +45,7 @@ describe('dynamic execution findings', () => {
         purpose: 'quality_review',
         round: 1,
         requestId: 'review-request-1',
-        usage: { promptTokens: 12, completionTokens: 4, totalTokens: 16, cost: 0.001 },
+        usage: { promptTokens: 12, completionTokens: 4, reasoningTokens: 2, totalTokens: 16, cost: 0.001 },
       }],
       findings: [openFinding],
     });
@@ -62,6 +62,7 @@ describe('dynamic execution findings', () => {
       provider: 'openrouter',
       purpose: 'quality_review',
       requestId: 'review-request-1',
+      usage: expect.objectContaining({ reasoningTokens: 2 }),
     })]);
   });
 

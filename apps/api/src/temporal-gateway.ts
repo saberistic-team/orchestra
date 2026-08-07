@@ -13,7 +13,7 @@ import {
   type ProjectSummary,
   type ReviewCheckpoint,
 } from '@orchestra/contracts';
-import { createPostgresTemporalDataConverter } from '@orchestra/database/temporal-payloads';
+import { createOrchestraDataConverter, type OrchestraDataConverterHandle } from '@orchestra/temporal-codec';
 import { Client, Connection, WorkflowNotFoundError } from '@temporalio/client';
 import { randomUUID } from 'node:crypto';
 
@@ -33,11 +33,8 @@ export interface ProjectTemporalGateway {
 @Injectable()
 export class TemporalGateway implements ProjectTemporalGateway, OnModuleDestroy {
   private connection?: Connection;
-  private readonly dataConverter = (() => {
-    const databaseUrl = process.env.DATABASE_URL;
-    if (!databaseUrl) throw new Error('DATABASE_URL is required for Temporal payload references.');
-    return createPostgresTemporalDataConverter(databaseUrl);
-  })();
+  private clientInstance?: Client;
+  private dataConverterHandle?: OrchestraDataConverterHandle;
 
   async createProject(brief: ProjectBrief): Promise<Project> {
     const client = await this.client();
@@ -158,15 +155,19 @@ export class TemporalGateway implements ProjectTemporalGateway, OnModuleDestroy 
   }
 
   private async client() {
+    if (this.clientInstance) return this.clientInstance;
+    this.dataConverterHandle ??= createOrchestraDataConverter();
     this.connection ??= await Connection.connect({ address: process.env.TEMPORAL_ADDRESS ?? 'localhost:7233' });
-    return new Client({
+    this.clientInstance = new Client({
       connection: this.connection,
       namespace: process.env.TEMPORAL_NAMESPACE ?? 'default',
-      dataConverter: this.dataConverter,
+      dataConverter: this.dataConverterHandle.dataConverter,
     });
+    return this.clientInstance;
   }
 
   async onModuleDestroy() {
     await this.connection?.close();
+    await this.dataConverterHandle?.close();
   }
 }

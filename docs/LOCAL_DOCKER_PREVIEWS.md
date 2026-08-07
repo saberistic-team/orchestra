@@ -4,9 +4,13 @@ Orchestra creates a runnable local deployment before it asks a person to approve
 
 ```mermaid
 flowchart LR
+  planner["Planner packaging-plan"] --> workflow["Templated Forgejo workflow"]
   builder["Builder commits Dockerfile + app"] --> forgejo["Forgejo iteration branch"]
-  forgejo --> manager["Preview manager resolves exact revision"]
-  manager --> build["Docker build from filtered archive"]
+  forgejo --> sandbox["Preview manager POST /build-checks"]
+  sandbox -->|fail| builder
+  sandbox -->|pass| evidence["packaging-evidence"]
+  evidence --> manager["Preview manager resolves exact revision"]
+  manager --> build["Docker build or reuse sandbox image"]
   build --> runtime["Isolated short-lived container"]
   runtime --> health["Docker + HTTP /health"]
   health --> test["Test records journey"]
@@ -16,6 +20,10 @@ flowchart LR
   human --> verify["Forgejo head re-check"]
   verify --> merge["Merge into main"]
 ```
+
+## Builder packaging sandbox
+
+Before Test/Reviewer handoff, Builder iterates against `POST /build-checks` on the preview manager. That endpoint executes only Planner-selected allowlisted checks (`docker_build`, `container_health`, `unit_tests`), returns structured evidence with truncated logs, and leaves no long-lived human preview. Image tags match the later preview deploy path so a green packaging build can be reused when the revision is unchanged. Forgejo Actions YAML is committed as the packaging contract (`workflow_dispatch` only) for humans and git history; Orchestra executes the mirrored checks itself and posts `orchestra/packaging/*` commit statuses as the handoff green light. There is no Actions runner in this milestone, so push-triggered workflow runs are intentionally not used (they would stay Waiting and get cancelled on each Builder commit).
 
 ## Repository contract
 

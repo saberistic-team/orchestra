@@ -538,7 +538,7 @@ describe('selectPriorAgentArtifacts', () => {
       project: {
         id: projectId, name: 'Orchestra', intent: 'Help people build software from intentions.', audience: 'Founders',
         success: 'A safe release is reviewed.', constraints: [], status: 'building', currentIteration: 2,
-        previewUrl: null, repositoryUrl: 'https://forgejo.example/orchestra', repositoryOwner: 'agent', repositoryName: 'orchestra', createdAt: now, updatedAt: now,
+        previewUrl: null, repositoryUrl: 'https://forgejo.example/orchestra', repositoryOwner: 'agent', repositoryName: 'orchestra', forgejoProjectId: null, createdAt: now, updatedAt: now,
       },
       iterations: [
         { id: secondIterationId, projectId, number: 2, objective: 'Second', status: 'active', startedAt: now, completedAt: null, issueNumber: 2, branchName: 'iteration-2-agents', pullRequestNumber: null, pullRequestUrl: null },

@@ -7,8 +7,9 @@ const sourceRoot = fileURLToPath(new URL('src/', apiRoot));
 const modelSourceRoot = fileURLToPath(new URL('../apps/model-worker/src/', import.meta.url));
 const appsRoot = fileURLToPath(new URL('../apps/', import.meta.url));
 const packageJson = JSON.parse(await readFile(new URL('package.json', apiRoot), 'utf8'));
+// Payload offload via @orchestra/temporal-codec is allowed: it only stores
+// Temporal claim-check blobs, not project application state.
 const forbiddenPackages = ['@orchestra/database', 'drizzle-orm', 'pg', 'postgres', 'ioredis', 'redis'];
-const temporalPayloadAdapter = '@orchestra/database/temporal-payloads';
 
 const dependencySections = ['dependencies', 'devDependencies', 'optionalDependencies'];
 const dependencyViolations = dependencySections.flatMap((section) =>
@@ -38,9 +39,6 @@ for (const file of files) {
   const displayPath = relative(process.cwd(), file);
 
   for (const dependency of forbiddenPackages) {
-    if (dependency === '@orchestra/database'
-      && file === join(sourceRoot, 'temporal-gateway.ts')
-      && source.includes(`from '${temporalPayloadAdapter}'`)) continue;
     if (source.includes(`from '${dependency}`) || source.includes(`from \"${dependency}`)) {
       importViolations.push(`${displayPath} imports ${dependency}`);
     }

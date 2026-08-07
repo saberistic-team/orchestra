@@ -524,7 +524,7 @@ describe('agent order context', () => {
     const builder = deliveryAgentGraph.find((step) => step.role === 'builder')!;
 
     expect(agentArtifactContextPatterns(builder)).toEqual(expect.arrayContaining([
-      'build-submission', 'source-file:*', 'iteration-plan',
+      'build-submission', 'source-file:*', 'iteration-plan', 'packaging-plan', 'packaging-evidence',
     ]));
   });
 

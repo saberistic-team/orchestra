@@ -50,6 +50,7 @@ export interface DynamicModelReasoningRequest {
 export interface DynamicModelUsage {
   promptTokens?: number;
   completionTokens?: number;
+  reasoningTokens?: number;
   totalTokens?: number;
   cost?: number;
 }
@@ -161,10 +162,14 @@ export interface DynamicArtifactExecutionInput {
    * reviewing and finalizing it again.
    */
   refreshCandidateAfterHumanDecision?: boolean;
+  /** Replay-safe rollout that reserves planning capacity for incorporating a newly recorded decision. */
+  extendPlanningAfterHumanDecision?: boolean;
   /** Replay-safe rollout for accepting a reviewed candidate at the exhausted revision boundary. */
   honorHumanReviewWaiver?: boolean;
   /** Replay-safe rollout that moves waived candidate questions out of the active decision channel. */
   deferQuestionsAfterHumanReviewWaiver?: boolean;
+  /** Replay-safe rollout for provider-reported reasoning token usage. */
+  acceptReasoningTokens?: boolean;
   checkpoint?: DynamicArtifactExecutionCheckpoint;
 }
 
@@ -195,6 +200,15 @@ export interface DynamicArtifactExecutionCheckpoint {
   findings: DynamicExecutionFinding[];
   noProgressRounds: number;
 }
+
+/**
+ * A recorded human decision changes the planning context after the original
+ * order has already spent part (or all) of its planning-round allowance.
+ * Serialized artifact transitions can require one plan each to revise, review,
+ * and finalize the retained candidate, so reserve exactly those three rounds
+ * for the resumed decision without relaxing any other execution ceiling.
+ */
+const HUMAN_DECISION_RESUME_PLANNING_ROUNDS = 3;
 
 export type DynamicArtifactExecutionResult = {
   status: 'completed';
@@ -287,15 +301,15 @@ function unexpectedDynamicKeys(
   return extras.length > 0 ? [`${label} contains unknown fields: ${extras.join(', ')}.`] : [];
 }
 
-function validateDynamicUsage(value: unknown, label: string): string[] {
+function validateDynamicUsage(value: unknown, label: string, acceptReasoningTokens = false): string[] {
   if (value === undefined) return [];
   if (!isDynamicRecord(value)) return [`${label} must be an object.`];
   const issues = unexpectedDynamicKeys(
     value,
-    ['promptTokens', 'completionTokens', 'totalTokens', 'cost'],
+    ['promptTokens', 'completionTokens', ...(acceptReasoningTokens ? ['reasoningTokens'] : []), 'totalTokens', 'cost'],
     label,
   );
-  for (const key of ['promptTokens', 'completionTokens', 'totalTokens', 'cost'] as const) {
+  for (const key of ['promptTokens', 'completionTokens', 'reasoningTokens', 'totalTokens', 'cost'] as const) {
     const amount = value[key];
     if (amount !== undefined && (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0)) {
       issues.push(`${label}.${key} must be a finite non-negative number.`);
@@ -304,7 +318,7 @@ function validateDynamicUsage(value: unknown, label: string): string[] {
   return issues;
 }
 
-function validateDynamicInferenceResult(value: unknown, label: string): string[] {
+function validateDynamicInferenceResult(value: unknown, label: string, acceptReasoningTokens = false): string[] {
   if (!isDynamicRecord(value)) return [`${label} must be an object.`];
   const issues = unexpectedDynamicKeys(
     value,
@@ -319,11 +333,11 @@ function validateDynamicInferenceResult(value: unknown, label: string): string[]
   if (value.requestId !== undefined && (typeof value.requestId !== 'string' || !value.requestId.trim())) {
     issues.push(`${label}.requestId must be a non-empty string.`);
   }
-  issues.push(...validateDynamicUsage(value.usage, `${label}.usage`));
+  issues.push(...validateDynamicUsage(value.usage, `${label}.usage`, acceptReasoningTokens));
   return issues;
 }
 
-function validateDynamicInvocation(value: unknown): string[] {
+function validateDynamicInvocation(value: unknown, acceptReasoningTokens = false): string[] {
   if (!isDynamicRecord(value)) return ['invocation must be an object.'];
   const issues = unexpectedDynamicKeys(
     value,
@@ -343,13 +357,14 @@ function validateDynamicInvocation(value: unknown): string[] {
   if (value.requestId !== undefined && (typeof value.requestId !== 'string' || !value.requestId.trim())) {
     issues.push('invocation.requestId must be a non-empty string.');
   }
-  issues.push(...validateDynamicUsage(value.usage, 'invocation.usage'));
+  issues.push(...validateDynamicUsage(value.usage, 'invocation.usage', acceptReasoningTokens));
   return issues;
 }
 
 function validateArtifactActionResult(
   expectedAction: 'generate_candidate' | 'quality_review' | 'revise_candidate',
   value: unknown,
+  acceptReasoningTokens = false,
 ): string[] {
   if (!isDynamicRecord(value)) return ['Capability result must be an object.'];
   const qualityReview = expectedAction === 'quality_review';
@@ -364,8 +379,9 @@ function validateArtifactActionResult(
   issues.push(...validateDynamicInferenceResult(
     qualityReview ? value.inference : value.candidate,
     qualityReview ? 'inference' : 'candidate',
+    acceptReasoningTokens,
   ));
-  issues.push(...validateDynamicInvocation(value.invocation));
+  issues.push(...validateDynamicInvocation(value.invocation, acceptReasoningTokens));
   if (qualityReview) {
     if (!isDynamicRecord(value.review)) {
       issues.push('review must be an object.');
@@ -495,7 +511,8 @@ function plannerSystemPrompt(input: DynamicArtifactExecutionInput) {
     'Use exactly this shape:',
     '{"protocolVersion":"1","goalAssessment":"...","contextVersion":0,"acknowledgedDecisionIds":[],"actions":[{"id":"...","activity":"...","activityVersion":"1.0","arguments":{},"dependsOn":[],"reason":"..."}],"completionCheck":{"type":"continue","reason":"..."}}',
     'completionCheck.type is continue, completed, human_input_required, or blocked.',
-    'For completed include evidenceRefs. For human_input_required include one decision with a stable decisionKey, 2-4 options, allowCustomAnswer, and allowAgentDecide. For blocked include an uppercase code.',
+    'For completed include evidenceRefs. For blocked include an uppercase code.',
+    'For human_input_required nest the decision under completionCheck.decision exactly like: {"type":"human_input_required","reason":"...","decision":{"decisionKey":"domain.choice","question":"...","options":[{"value":"a","label":"A"},{"value":"b","label":"B"}],"allowCustomAnswer":true,"allowAgentDecide":false}}. Never place decisionKey, question, options, allowCustomAnswer, or allowAgentDecide at the plan root.',
     ...(input.discardTerminalControlActions ? [
       'For human_input_required or blocked, actions must be []. The structured decision or blocker is the complete terminal output; never generate an artifact to explain it.',
     ] : []),
@@ -512,7 +529,7 @@ function plannerSystemPrompt(input: DynamicArtifactExecutionInput) {
       'A human decision must use question (never prompt) and a lowercase decisionKey separated with dots, underscores, or hyphens (never colons).',
     ] : []),
     ...(input.normalizeArtifactStateTransitions ? [
-      'Artifact progression is workflow-owned: generate when no candidate exists, review the current candidate once, revise only after recorded findings, and complete after a passing current review.',
+      'Artifact progression is workflow-owned: generate when no candidate exists, review the current candidate once, revise only after recorded findings, and complete after a passing current review. Do not ask a human to approve or skip the independent model review; schedule model.review_artifact instead.',
     ] : []),
     'Plan only the next useful batch. Incorporate observations before choosing later work.',
     'Do not repeat a successful action. Do not claim completed unless the current candidate has a passing review; the workflow will still verify the artifact contract.',
@@ -601,31 +618,70 @@ function normalizedDecisionKey(value: unknown): unknown {
     .replace(/^[._-]+|[._-]+$/gu, '');
 }
 
-function normalizeDecisionEnvelope(value: unknown, enabled: boolean | undefined): unknown {
+/**
+ * Normalize human-decision plan drift before schema validation.
+ * Models often flatten decisionKey/options onto the plan root or omit question.
+ */
+export function normalizeDecisionEnvelope(value: unknown, enabled: boolean | undefined): unknown {
   if (!enabled || !isDynamicRecord(value)) return value;
   const completionCheck = value.completionCheck;
   if (!isDynamicRecord(completionCheck) || completionCheck.type !== 'human_input_required') return value;
-  const decision = completionCheck.decision;
-  if (!isDynamicRecord(decision)) return value;
+
+  const nested = isDynamicRecord(completionCheck.decision) ? completionCheck.decision : {};
+  const decisionKey = nested.decisionKey ?? value.decisionKey ?? completionCheck.decisionKey;
+  const question = nested.question ?? nested.prompt
+    ?? value.question ?? value.prompt
+    ?? completionCheck.question ?? completionCheck.prompt;
+  const context = nested.context ?? value.context ?? completionCheck.context;
+  const options = nested.options ?? value.options ?? completionCheck.options;
+  const allowCustomAnswer = nested.allowCustomAnswer
+    ?? value.allowCustomAnswer
+    ?? completionCheck.allowCustomAnswer;
+  const allowAgentDecide = nested.allowAgentDecide
+    ?? value.allowAgentDecide
+    ?? completionCheck.allowAgentDecide;
+  const resolvedQuestion = typeof question === 'string' && question.trim()
+    ? question
+    : (typeof completionCheck.reason === 'string' && completionCheck.reason.trim()
+      ? completionCheck.reason
+      : undefined);
+
+  const {
+    decisionKey: _rootDecisionKey,
+    question: _rootQuestion,
+    prompt: _rootPrompt,
+    context: _rootContext,
+    options: _rootOptions,
+    allowCustomAnswer: _rootAllowCustom,
+    allowAgentDecide: _rootAllowAgent,
+    ...planWithoutDecisionFields
+  } = value;
+  const {
+    decision: _nestedDecision,
+    decisionKey: _checkDecisionKey,
+    question: _checkQuestion,
+    prompt: _checkPrompt,
+    context: _checkContext,
+    options: _checkOptions,
+    allowCustomAnswer: _checkAllowCustom,
+    allowAgentDecide: _checkAllowAgent,
+    ...completionWithoutDecisionFields
+  } = completionCheck;
+
   return {
-    ...value,
+    ...planWithoutDecisionFields,
     completionCheck: {
-      ...completionCheck,
+      ...completionWithoutDecisionFields,
+      type: 'human_input_required',
       decision: {
-        ...(decision.decisionKey !== undefined
-          ? { decisionKey: normalizedDecisionKey(decision.decisionKey) }
+        ...(decisionKey !== undefined
+          ? { decisionKey: normalizedDecisionKey(decisionKey) }
           : {}),
-        ...(decision.question !== undefined
-          ? { question: decision.question }
-          : decision.prompt !== undefined ? { question: decision.prompt } : {}),
-        ...(decision.context !== undefined ? { context: decision.context } : {}),
-        ...(decision.options !== undefined ? { options: decision.options } : {}),
-        ...(decision.allowCustomAnswer !== undefined
-          ? { allowCustomAnswer: decision.allowCustomAnswer }
-          : {}),
-        ...(decision.allowAgentDecide !== undefined
-          ? { allowAgentDecide: decision.allowAgentDecide }
-          : {}),
+        ...(resolvedQuestion !== undefined ? { question: resolvedQuestion } : {}),
+        ...(context !== undefined ? { context } : {}),
+        ...(options !== undefined ? { options } : {}),
+        ...(allowCustomAnswer !== undefined ? { allowCustomAnswer } : {}),
+        ...(allowAgentDecide !== undefined ? { allowAgentDecide } : {}),
       },
     },
   };
@@ -781,6 +837,102 @@ export function buildDynamicPlanningRequest(
   };
 }
 
+export type PlanDriftKind =
+  | 'flattened_decision_fields'
+  | 'missing_decision_object'
+  | 'missing_decision_question'
+  | 'invalid_decision_key'
+  | 'actions_with_terminal_completion'
+  | 'unparseable_json'
+  | 'schema_invalid';
+
+export interface PlanDriftClassification {
+  kinds: PlanDriftKind[];
+  hints: string[];
+}
+
+/**
+ * Classify structural plan drift so repair prompts can name the failure mode
+ * instead of only echoing opaque Zod "Invalid input" messages.
+ */
+export function classifyPlanDrift(
+  invalidOutput: string,
+  issues: readonly DynamicPlanValidationIssue[],
+): PlanDriftClassification {
+  let parsed: unknown;
+  try {
+    parsed = parseDynamicExecutionPlan(invalidOutput);
+  } catch {
+    return {
+      kinds: ['unparseable_json'],
+      hints: ['Return one strict JSON object only. No Markdown fences, commentary, or truncated output.'],
+    };
+  }
+
+  const kinds: PlanDriftKind[] = [];
+  const hints: string[] = [];
+  const record = isDynamicRecord(parsed) ? parsed : undefined;
+  const completionCheck = record && isDynamicRecord(record.completionCheck)
+    ? record.completionCheck
+    : undefined;
+  const nestedDecision = completionCheck && isDynamicRecord(completionCheck.decision)
+    ? completionCheck.decision
+    : undefined;
+  const flattenedDecisionFields = Boolean(record && (
+    record.decisionKey !== undefined
+    || record.options !== undefined
+    || record.question !== undefined
+    || record.prompt !== undefined
+    || record.allowCustomAnswer !== undefined
+    || record.allowAgentDecide !== undefined
+  ));
+
+  if (completionCheck?.type === 'human_input_required') {
+    if (flattenedDecisionFields) {
+      kinds.push('flattened_decision_fields');
+      hints.push('Nest decisionKey, question, options, allowCustomAnswer, and allowAgentDecide under completionCheck.decision. Do not place them at the plan root.');
+    }
+    if (!nestedDecision && !flattenedDecisionFields) {
+      kinds.push('missing_decision_object');
+      hints.push('human_input_required requires completionCheck.decision as an object with decisionKey, question, options (2-4), allowCustomAnswer, and allowAgentDecide.');
+    }
+    if (nestedDecision
+      && nestedDecision.question === undefined
+      && nestedDecision.prompt === undefined
+      && record?.question === undefined
+      && record?.prompt === undefined) {
+      kinds.push('missing_decision_question');
+      hints.push('Include completionCheck.decision.question as a non-empty string (never prompt).');
+    }
+  }
+
+  const issueText = issues.map((entry) => `${entry.code} ${entry.message}`).join(' ').toLowerCase();
+  if (issueText.includes('decisionkey') || issueText.includes('decision.key')) {
+    kinds.push('invalid_decision_key');
+    hints.push('decisionKey must be lowercase with dots, underscores, or hyphens (for example requirements.baseline_final), never colons.');
+  }
+
+  if (
+    completionCheck
+    && (completionCheck.type === 'human_input_required' || completionCheck.type === 'blocked')
+    && Array.isArray(record?.actions)
+    && record.actions.length > 0
+  ) {
+    kinds.push('actions_with_terminal_completion');
+    hints.push('For human_input_required or blocked, actions must be [].');
+  }
+
+  if (kinds.length === 0) {
+    kinds.push('schema_invalid');
+    hints.push('Match the exact plan JSON shape from the system prompt, especially completionCheck nesting and required fields.');
+  }
+
+  return {
+    kinds: [...new Set(kinds)],
+    hints: [...new Set(hints)],
+  };
+}
+
 export function buildDynamicPlanRepairRequest(
   input: DynamicArtifactExecutionInput,
   state: ArtifactLoopState,
@@ -789,6 +941,7 @@ export function buildDynamicPlanRepairRequest(
   invalidOutput: string,
   issues: readonly DynamicPlanValidationIssue[],
 ): DynamicModelReasoningRequest {
+  const drift = classifyPlanDrift(invalidOutput, issues);
   return {
     role: input.input.role,
     purpose: 'plan_repair',
@@ -806,7 +959,13 @@ export function buildDynamicPlanRepairRequest(
           '<VALIDATION_ISSUES>',
           ...issues.map((entry) => `- ${entry.code}: ${entry.message}`),
           '</VALIDATION_ISSUES>',
-          'Return a complete replacement plan. No action from the invalid plan ran.',
+          '<DETECTED_DRIFT>',
+          ...drift.kinds.map((kind) => `- kind: ${kind}`),
+          '</DETECTED_DRIFT>',
+          '<AVOID_IN_REPLACEMENT>',
+          ...drift.hints.map((hint) => `- ${hint}`),
+          '</AVOID_IN_REPLACEMENT>',
+          'Return a complete replacement plan that avoids every DETECTED_DRIFT kind. No action from the invalid plan ran.',
         ].join('\n'),
       },
     ],
@@ -814,7 +973,9 @@ export function buildDynamicPlanRepairRequest(
 }
 
 export function parseDynamicExecutionPlan(raw: string): unknown {
-  return JSON.parse(raw.trim()) as unknown;
+  const trimmed = raw.trim();
+  const fenced = /^```(?:json)?[\t ]*\r?\n([\s\S]*?)\r?\n```$/iu.exec(trimmed);
+  return JSON.parse(fenced?.[1] ?? trimmed) as unknown;
 }
 
 function addModelUsage(usage: DynamicExecutionUsage, result: DynamicModelResult): DynamicExecutionUsage {
@@ -964,13 +1125,19 @@ function boundedActionResultBytes(
 function assertValidActionResult(
   action: DynamicExecutionPlan['actions'][number],
   value: unknown,
+  acceptReasoningTokens = false,
 ): void {
   const capability = dynamicArtifactCapabilities.find(({ descriptor: candidate }) =>
     candidate.name === action.activity && candidate.version === action.activityVersion);
   if (!capability?.validateResult) {
     throw new Error(`No output validator is registered for ${action.activity}@${action.activityVersion}.`);
   }
-  const issues = capability.validateResult(value);
+  const expectedAction = action.activity === 'model.generate_artifact'
+    ? 'generate_candidate'
+    : action.activity === 'model.review_artifact'
+      ? 'quality_review'
+      : 'revise_candidate';
+  const issues = validateArtifactActionResult(expectedAction, value, acceptReasoningTokens);
   if (issues.length > 0) {
     throw new Error(`${action.activity} returned an invalid result: ${issues.join(' ')}`);
   }
@@ -1160,7 +1327,7 @@ async function executeArtifactAction(
         action: 'generate_candidate',
         input: execution.input,
       }, inferenceBudget), operationKey);
-      assertValidActionResult(action, result);
+      assertValidActionResult(action, result, execution.acceptReasoningTokens);
       if (result.action !== 'generate_candidate') throw new Error('Generation returned the wrong action result.');
       state.invocations.push(auditableInvocation(result.invocation));
       state.usage = addModelUsage(state.usage, result.candidate);
@@ -1176,7 +1343,7 @@ async function executeArtifactAction(
         candidate: state.candidate.content,
         round: state.revisionCount,
       }, inferenceBudget), operationKey);
-      assertValidActionResult(action, result);
+      assertValidActionResult(action, result, execution.acceptReasoningTokens);
       if (result.action !== 'quality_review') throw new Error('Review returned the wrong action result.');
       state.invocations.push(auditableInvocation(result.invocation));
       state.usage = addModelUsage(state.usage, result.inference);
@@ -1203,7 +1370,7 @@ async function executeArtifactAction(
         review: state.review,
         round: state.revisionCount + 1,
       }, inferenceBudget), operationKey);
-      assertValidActionResult(action, result);
+      assertValidActionResult(action, result, execution.acceptReasoningTokens);
       if (result.action !== 'revise_candidate') throw new Error('Revision returned the wrong action result.');
       state.invocations.push(auditableInvocation(result.invocation));
       state.usage = addModelUsage(state.usage, result.candidate);
@@ -1405,6 +1572,15 @@ export async function executeDynamicArtifactOrder(
   }
 
   const elapsedMs = () => elapsedBeforeResume + Math.max(0, now() - startedAt);
+  const activeLimits = checkpoint && !checkpointMismatch && execution.extendPlanningAfterHumanDecision
+    ? {
+        ...limits,
+        maxPlanningRounds: Math.max(
+          limits.maxPlanningRounds,
+          state.usage.planningRounds + HUMAN_DECISION_RESUME_PLANNING_ROUNDS,
+        ),
+      }
+    : limits;
   const inferenceBudget = () => {
     const currentTime = now();
     const currentElapsedMs = elapsedBeforeResume + Math.max(0, currentTime - startedAt);
@@ -1413,7 +1589,7 @@ export async function executeDynamicArtifactOrder(
   const capabilities = capabilitiesForExecution(execution);
 
   while (true) {
-    const exhaustedBeforePlanning = budgetReason(state, limits, elapsedMs());
+    const exhaustedBeforePlanning = budgetReason(state, activeLimits, elapsedMs());
     if (exhaustedBeforePlanning) {
       return {
         status: 'budget_exhausted',
@@ -1432,7 +1608,7 @@ export async function executeDynamicArtifactOrder(
 
     while (!acceptedPlan) {
       const planOperationKey = `${execution.executionId}/plan/${round}/repair/${repairAttempt}`;
-      const exhaustedImmediatelyBeforePlanning = budgetReason(state, limits, elapsedMs());
+      const exhaustedImmediatelyBeforePlanning = budgetReason(state, activeLimits, elapsedMs());
       if (exhaustedImmediatelyBeforePlanning) {
         return {
           status: 'budget_exhausted',
@@ -1469,7 +1645,7 @@ export async function executeDynamicArtifactOrder(
           trace: trace(execution.executionId, 'blocked', reason, limits, state),
         };
       }
-      const exceededAfterPlanningCall = exceededBudgetReason(state, limits, elapsedMs());
+      const exceededAfterPlanningCall = exceededBudgetReason(state, activeLimits, elapsedMs());
       if (exceededAfterPlanningCall) {
         return {
           status: 'budget_exhausted',
@@ -1480,10 +1656,11 @@ export async function executeDynamicArtifactOrder(
       let value: unknown;
       let validationIssues: DynamicPlanValidationIssue[];
       try {
-        value = normalizeDecisionEnvelope(normalizeDecisionOptions(
+        // Hoist/alias the decision envelope first, then strip option drift.
+        value = normalizeDecisionOptions(normalizeDecisionEnvelope(
           parseDynamicExecutionPlan(result.content),
-          execution.normalizeDecisionOptions,
-        ), execution.normalizeDecisionEnvelope);
+          execution.normalizeDecisionEnvelope,
+        ), execution.normalizeDecisionOptions);
         const parsedPlan = dynamicExecutionPlanSchema.safeParse(value);
         if (parsedPlan.success) {
           value = normalizeArtifactStateTransitions(bindPlanningContextVersion(discardModelAuthoredArguments(
@@ -1536,7 +1713,7 @@ export async function executeDynamicArtifactOrder(
         ),
         inferenceBudget(),
       );
-      const exhaustedDuringRepair = budgetReason(state, limits, elapsedMs());
+      const exhaustedDuringRepair = budgetReason(state, activeLimits, elapsedMs());
       if (exhaustedDuringRepair) {
         return {
           status: 'budget_exhausted',
@@ -1640,7 +1817,7 @@ export async function executeDynamicArtifactOrder(
           trace: trace(execution.executionId, 'blocked', reason, limits, state),
         };
       }
-      const exceededAfterActions = exceededBudgetReason(state, limits, elapsedMs());
+      const exceededAfterActions = exceededBudgetReason(state, activeLimits, elapsedMs());
       if (exceededAfterActions) {
         return {
           status: 'budget_exhausted',

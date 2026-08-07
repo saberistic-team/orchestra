@@ -1,4 +1,6 @@
 import {
+  DEFAULT_PACKAGING_PLAN,
+  PACKAGING_CONTRACT_VERSION,
   PREVIEW_CONTRACT_VERSION,
   PREVIEW_RUNTIME_CONTRACT,
   type PreviewDeploymentResult,
@@ -21,6 +23,7 @@ import {
   previewAdapterInternals,
   probePreviewHealth,
   previewHealthInternals,
+  runPackagingBuildChecks,
 } from './activities.js';
 
 afterEach(() => {
@@ -151,6 +154,54 @@ describe('preview deployment activity', () => {
       .mockResolvedValue({ status: 200, text: JSON.stringify(incomplete) });
 
     await expect(deployIterationPreview(fixture())).rejects.toThrow(/invalid managed evidence.*imageDigest/i);
+  });
+
+  it('posts packaging checks to the preview-manager build-checks endpoint', async () => {
+    vi.stubEnv('PREVIEW_DEPLOY_WEBHOOK_URL', 'https://deployer.example.test/previews');
+    vi.stubEnv('PREVIEW_DEPLOY_TOKEN', 'preview-token');
+    const input = fixture();
+    const payload = {
+      contractVersion: PACKAGING_CONTRACT_VERSION,
+      evidence: {
+        contractVersion: PACKAGING_CONTRACT_VERSION,
+        revision,
+        imageDigest: `sha256:${'a'.repeat(64)}`,
+        checks: [{
+          id: 'docker-build',
+          kind: 'docker_build',
+          required: true,
+          status: 'passed',
+          summary: 'ok',
+          log: '',
+        }, {
+          id: 'container-health',
+          kind: 'container_health',
+          required: true,
+          status: 'passed',
+          summary: 'ok',
+          log: '',
+        }],
+        passed: true,
+        attemptedAt: '2026-08-05T12:00:00.000Z',
+      },
+      previewContractVersion: PREVIEW_CONTRACT_VERSION,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(payload), {
+      status: 201,
+      headers: { 'content-type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(runPackagingBuildChecks({
+      ...input,
+      plan: DEFAULT_PACKAGING_PLAN,
+    })).resolves.toMatchObject({ evidence: { passed: true, revision } });
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://deployer.example.test/build-checks');
+    expect(JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body))).toMatchObject({
+      contractVersion: PACKAGING_CONTRACT_VERSION,
+      plan: DEFAULT_PACKAGING_PLAN,
+    });
   });
 
   it('rejects a managed deployment that points browser validation at a control-plane host', async () => {

@@ -10,15 +10,18 @@ COPY apps/worker/package.json apps/worker/package.json
 COPY apps/model-worker/package.json apps/model-worker/package.json
 COPY apps/preview-manager/package.json apps/preview-manager/package.json
 COPY apps/validation-worker/package.json apps/validation-worker/package.json
+COPY apps/temporal-codec/package.json apps/temporal-codec/package.json
 COPY apps/web/package.json apps/web/package.json
 COPY packages/contracts/package.json packages/contracts/package.json
 COPY packages/database/package.json packages/database/package.json
+COPY packages/temporal-codec/package.json packages/temporal-codec/package.json
 RUN pnpm install --frozen-lockfile
 
 COPY apps/model-worker apps/model-worker
 COPY packages/contracts packages/contracts
 COPY packages/database packages/database
-RUN pnpm --filter @orchestra/contracts build && pnpm --filter @orchestra/database build && pnpm --filter @orchestra/model-worker build
+COPY packages/temporal-codec packages/temporal-codec
+RUN pnpm --filter @orchestra/contracts build && pnpm --filter @orchestra/database build && pnpm --filter @orchestra/temporal-codec build && pnpm --filter @orchestra/model-worker build
 RUN pnpm --filter @orchestra/model-worker deploy --prod /deploy/model-worker
 
 FROM node:26.5.0-bookworm-slim@sha256:2d49d876e96237d76de412761cf05dbfe5aee325cc4406a4d41d5824c5bb8beb

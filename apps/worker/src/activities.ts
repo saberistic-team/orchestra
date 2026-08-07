@@ -1,8 +1,86 @@
-import { artifactContentAddress, deliveryAgentGraph, resolveModelConcurrency, type AgentArtifactDraft, type AgentArtifactReference, type AgentCommentInput, type AgentExecutionGraph, type AgentInteraction, type AgentInteractionKind, type AgentInteractionParty, type AgentInteractionStatus, type AgentMessage, type AgentOrder, type AgentQuestion, type AgentQuestionAnswerInput, type AgentRole, type AgentRuntimeSnapshot, type ArtifactFeedbackInput, type DeliveryAgentDefinition, type DynamicExecutionTrace, type DynamicHumanDecisionRequest, type IterationReadiness, type IterationReview, type IterationReviewProposal, type MessageThread, type PreviewDeploymentResult, type Project, type ProjectArtifact, type ProjectBrief, type ProjectDetail, type ProjectEvent, type ProjectIteration, type ProjectStatus, type ProjectSummary } from '@orchestra/contracts';
+import {
+  artifactContentAddress,
+  deliveryAgentGraph,
+  forgejoIssueActionSchema,
+  forgejoWorkPackagesDocumentSchema,
+  formatForgejoIssuesContext,
+  packagingEvidenceSatisfiesPlan,
+  resolvePackagingPlanFromArtifacts,
+  resolveModelConcurrency,
+  type AgentArtifactDraft,
+  type AgentArtifactReference,
+  type AgentCommentInput,
+  type AgentExecutionGraph,
+  type AgentInteraction,
+  type AgentInteractionKind,
+  type AgentInteractionParty,
+  type AgentInteractionStatus,
+  type AgentMessage,
+  type AgentOrder,
+  type AgentQuestion,
+  type AgentQuestionAnswerInput,
+  type AgentRole,
+  type AgentRuntimeSnapshot,
+  type ArtifactFeedbackInput,
+  type DeliveryAgentDefinition,
+  type DynamicExecutionTrace,
+  type DynamicHumanDecisionRequest,
+  type ForgejoIssueAction,
+  type ForgejoIssueRef,
+  type ForgejoWorkPackage,
+  type IterationReadiness,
+  type IterationReview,
+  type IterationReviewProposal,
+  type MessageThread,
+  type PackagingEvidence,
+  type PackagingPlan,
+  type PreviewDeploymentResult,
+  type Project,
+  type ProjectArtifact,
+  type ProjectBrief,
+  type ProjectDetail,
+  type ProjectEvent,
+  type ProjectIteration,
+  type ProjectStatus,
+  type ProjectSummary,
+} from '@orchestra/contracts';
 import { resolveModelProvider } from '@orchestra/contracts';
-import { defaultMigrationsFolder, normalizeDecisionKey, ProjectStore, type ArtifactOperationRecoveryEnvelope, type RecordAgentRuntimeStateInput } from '@orchestra/database';
+import {
+  defaultMigrationsFolder,
+  normalizeDecisionKey,
+  ProjectStore,
+  type ArtifactOperationRecoveryEnvelope,
+  type RecordAgentRuntimeStateInput,
+} from '@orchestra/database';
 import { createHash } from 'node:crypto';
-import { addIterationComment, addIterationCommentOnce, agentCommitSummary, applyIterationReviewLifecycle, commitArtifact, createForgejoLifecycleAdapter, createIterationIssue, createIterationPullRequest, ensureProjectLifecycleLabels, ensureProjectRepository, labelIterationAgent, labelIterationStatus, type ForgejoIterationLifecycleResult } from './forgejo.js';
+import {
+  addIssueComment,
+  addIterationComment,
+  addIterationCommentOnce,
+  agentCommitSummary,
+  applyForgejoIssueActions,
+  applyIterationReviewLifecycle,
+  claimAgentIssues,
+  commitArtifact,
+  commitPackagingWorkflow,
+  createForgejoLifecycleAdapter,
+  createIterationIssue,
+  createIterationPullRequest,
+  createPackagingCommitStatuses,
+  defaultManagerWorkPackages,
+  ensureDeliveryProjectBoard,
+  ensureProjectLifecycleLabels,
+  ensureProjectRepository,
+  labelIterationAgent,
+  labelIterationStatus,
+  listOpenIssuesForAgent,
+  listOpenWorkIssues,
+  materializeWorkPackages,
+  refreshUmbrellaWorkChecklist,
+  type AppliedForgejoIssueActions,
+  type DeliveryProjectBoard,
+  type ForgejoIterationLifecycleResult,
+} from './forgejo.js';
 import { interactionFromOrganismEvent, projectOrganismEvents } from './organism-event-projection.js';
 
 let projectStore: ProjectStore | undefined;
@@ -266,6 +344,16 @@ export function toAgentArtifactReference(artifact: ProjectArtifact): AgentArtifa
     repositoryPath: artifact.repositoryPath,
     repositoryUrl: artifact.repositoryUrl,
   };
+}
+
+async function loadArtifactReferenceContent(reference: AgentArtifactReference): Promise<string | undefined> {
+  if (reference.content !== undefined) return reference.content;
+  const address = new URL(reference.contentAddress);
+  if (address.protocol !== 'orchestra-artifact:' || address.hostname !== 'postgres') return undefined;
+  const [projectId, artifactId] = address.pathname.split('/').filter(Boolean);
+  const version = Number(address.searchParams.get('version'));
+  if (!projectId || !artifactId || !Number.isSafeInteger(version) || version <= 0) return undefined;
+  return (await (await store()).artifactContent(projectId, artifactId, version))?.content;
 }
 
 export async function getPriorAgentArtifacts(
@@ -1087,8 +1175,12 @@ export async function setIterationStatus(
 export async function connectProjectRepository(project: Project): Promise<Project> {
   const repository = await ensureProjectRepository(project);
   const database = await store();
-  const connected = await database.connectRepository(project.id, repository);
+  let connected = await database.connectRepository(project.id, repository);
   const labels = await ensureProjectLifecycleLabels(connected);
+  const board = await ensureDeliveryProjectBoard(connected);
+  if (board.projectId != null) {
+    connected = await database.setForgejoProjectId(connected.id, board.projectId);
+  }
   await database.recordRepositoryLifecycle({
     projectId: project.id,
     kind: 'repository_connected',
@@ -1096,13 +1188,159 @@ export async function connectProjectRepository(project: Project): Promise<Projec
     repositoryUrl: repository.url,
     externalId: `${repository.owner}/${repository.name}`,
     summary: 'The shared Forgejo repository is connected to the project organism.',
-    metadata: { owner: repository.owner, name: repository.name, labels },
+    metadata: {
+      owner: repository.owner,
+      name: repository.name,
+      labels,
+      forgejoProjectId: board.projectId,
+      columnsSupported: board.columnsSupported,
+    },
   });
   await database.addEvent({
     projectId: project.id, iterationNumber: null, kind: 'project',
-    title: 'Forgejo repository connected', description: `Agents will collaborate in ${repository.owner}/${repository.name}.`, agentRole: 'manager',
+    title: 'Forgejo repository connected',
+    description: board.projectId != null
+      ? `Agents will collaborate in ${repository.owner}/${repository.name} on delivery board #${board.projectId}.`
+      : `Agents will collaborate in ${repository.owner}/${repository.name}. Forgejo projects API is unavailable, so the delivery board was skipped.`,
+    agentRole: 'manager',
   });
   return connected;
+}
+
+function parseWorkPackagesFromArtifacts(artifacts: readonly ProjectArtifact[]): ForgejoWorkPackage[] | undefined {
+  const match = [...artifacts].reverse().find((artifact) => artifact.type === 'work-packages');
+  if (!match) return undefined;
+  try {
+    const parsed = forgejoWorkPackagesDocumentSchema.safeParse(JSON.parse(match.content));
+    return parsed.success ? parsed.data.packages : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function boardForProject(project: Project): Promise<DeliveryProjectBoard | undefined> {
+  if (!project.repositoryOwner || !project.repositoryName) return undefined;
+  try {
+    const board = await ensureDeliveryProjectBoard(project);
+    return board.projectId != null ? board : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function materializeManagerWorkPackages(
+  project: Project,
+  iteration: ProjectIteration,
+  artifacts: readonly AgentArtifactReference[],
+): Promise<{ issueNumbers: number[] }> {
+  const database = await store();
+  const existing = await database.listIterationWorkIssues(iteration.id);
+  if (existing.length > 0) {
+    return { issueNumbers: existing.map((item) => item.issueNumber) };
+  }
+  const workPackagesArtifact = [...artifacts].reverse().find((artifact) => artifact.type === 'work-packages');
+  const workPackagesContent = workPackagesArtifact
+    ? await loadArtifactReferenceContent(workPackagesArtifact)
+    : undefined;
+  let packages: ForgejoWorkPackage[] | undefined;
+  if (workPackagesContent) {
+    try {
+      const parsed = forgejoWorkPackagesDocumentSchema.safeParse(JSON.parse(workPackagesContent));
+      if (parsed.success) packages = parsed.data.packages;
+    } catch {
+      // Invalid model output falls back to the bounded default package set.
+    }
+  }
+  packages ??= defaultManagerWorkPackages(project, iteration);
+  const board = await boardForProject(project);
+  const created = await materializeWorkPackages(project, iteration, packages, board);
+  for (const issue of created) {
+    await database.recordIterationWorkIssue({
+      projectId: project.id,
+      iterationId: iteration.id,
+      issueNumber: issue.number,
+      packageKey: issue.key,
+      title: issue.title,
+      createdByRole: 'manager',
+    });
+  }
+  await refreshUmbrellaWorkChecklist(project, iteration, created, 'manager');
+  await addIterationComment(
+    project,
+    iteration,
+    `Opened ${created.length} Forgejo work issues:\n${created.map((issue) => `- #${issue.number} ${issue.title}`).join('\n')}`,
+    'manager',
+  );
+  await database.addEvent({
+    projectId: project.id,
+    iterationNumber: iteration.number,
+    kind: 'project',
+    title: 'Forgejo work packages created',
+    description: `Manager materialized ${created.length} work issues for agent collaboration.`,
+    agentRole: 'manager',
+  });
+  return { issueNumbers: created.map((issue) => issue.number) };
+}
+
+export async function loadAgentForgejoIssues(
+  project: Project,
+  role: AgentRole,
+): Promise<{ issues: ForgejoIssueRef[]; context: string }> {
+  const issues = role === 'planner'
+    ? await listOpenWorkIssues(project)
+    : await listOpenIssuesForAgent(project, role);
+  return { issues, context: formatForgejoIssuesContext(issues) };
+}
+
+export async function applyAgentForgejoIssueActions(
+  project: Project,
+  iteration: ProjectIteration,
+  role: AgentRole,
+  draft: AgentArtifactDraft,
+): Promise<AppliedForgejoIssueActions> {
+  const actions: ForgejoIssueAction[] = [];
+  for (const candidate of draft.forgejoIssueActions ?? []) {
+    const parsed = forgejoIssueActionSchema.safeParse(candidate);
+    if (parsed.success) actions.push(parsed.data);
+  }
+  const board = await boardForProject(project);
+  const applied = actions.length > 0
+    ? await applyForgejoIssueActions(project, iteration, role, actions, board)
+    : { createdIssues: [], calledRoles: [], completedIssueNumbers: [] };
+
+  const database = await store();
+  for (const issue of applied.createdIssues) {
+    await database.recordIterationWorkIssue({
+      projectId: project.id,
+      iterationId: iteration.id,
+      issueNumber: issue.number,
+      packageKey: issue.key ?? null,
+      title: issue.title,
+      createdByRole: role,
+      parentIssueNumber: issue.parentIssueNumber ?? null,
+    });
+  }
+  if (applied.createdIssues.length > 0) {
+    const tracked = await database.listIterationWorkIssues(iteration.id);
+    await refreshUmbrellaWorkChecklist(
+      project,
+      iteration,
+      tracked.map((item) => ({ number: item.issueNumber, title: item.title, key: item.packageKey ?? undefined })),
+      role,
+    );
+  }
+  return applied;
+}
+
+export async function mirrorHumanGuidanceToForgejo(
+  project: Project,
+  role: AgentRole,
+  summary: string,
+): Promise<void> {
+  const issues = await listOpenIssuesForAgent(project, role);
+  for (const issue of issues.slice(0, 5)) {
+    await addIssueComment(project, issue.number, `🧑 **Human → ${role}:** ${summary}`);
+  }
 }
 
 export async function prepareIterationRepository(project: Project, iteration: ProjectIteration): Promise<ProjectIteration> {
@@ -1141,7 +1379,12 @@ export async function prepareIterationRepository(project: Project, iteration: Pr
   for (const artifact of selectRepositoryPreparationArtifacts(detail, iteration.id)) {
     const location = await commitArtifact(project, prepared, artifact);
     const located = await (await store()).locateArtifact(artifact.id, location.path, location.url);
-    await addIterationComment(project, prepared, agentCommitSummary(artifact.producedBy, located));
+    await addIterationComment(
+      project,
+      prepared,
+      agentCommitSummary(artifact.producedBy, located),
+      artifact.producedBy,
+    );
   }
   return prepared;
 }
@@ -1185,7 +1428,18 @@ export async function recordAgentStarted(
     agentRole: role,
   });
   const received = inputArtifacts?.length ? ` Received: ${inputArtifacts.map((artifact) => `[${artifact.name}](${artifact.repositoryUrl ?? project.repositoryUrl})`).join(', ')}.` : '';
-  await addIterationComment(project, iteration, `🟠 **${role} agent started** using its dedicated Temporal workflow.${received}${supervision}`);
+  await addIterationComment(
+    project,
+    iteration,
+    `🟠 Started work using the dedicated Temporal workflow.${received}${supervision}`,
+    role,
+  );
+  try {
+    const assigned = await listOpenIssuesForAgent(project, role);
+    if (assigned.length > 0) await claimAgentIssues(project, role, assigned);
+  } catch {
+    // Forgejo issue claim is best-effort; Temporal delivery continues.
+  }
 }
 
 export interface RecordedAgentArtifacts {
@@ -1295,9 +1549,15 @@ export async function recordAgentArtifact(
     saved.push(recorded);
     const comment = agentCommitSummary(operationDraft.producedBy, recorded);
     if (childOperationKey) {
-      await addIterationCommentOnce(project, iteration, comment, `${childOperationKey}:comment`);
+      await addIterationCommentOnce(
+        project,
+        iteration,
+        comment,
+        `${childOperationKey}:comment`,
+        operationDraft.producedBy,
+      );
     } else {
-      await addIterationComment(project, iteration, comment);
+      await addIterationComment(project, iteration, comment, operationDraft.producedBy);
     }
   }
   const questionIds: string[] = [];
@@ -1404,6 +1664,18 @@ export async function persistAgentQuestionAnswer(
     description: describeQuestionAnswer(answer, answered),
     agentRole: existing.agentRole,
   });
+  const detail = await database.detail(projectId);
+  if (detail?.project.repositoryOwner) {
+    try {
+      await mirrorHumanGuidanceToForgejo(
+        detail.project,
+        existing.agentRole,
+        describeQuestionAnswer(answer, answered),
+      );
+    } catch {
+      // mirroring is best-effort
+    }
+  }
   return answered;
 }
 
@@ -1432,6 +1704,13 @@ export async function persistAgentComment(
     description: comment.body,
     agentRole: comment.agentRole,
   });
+  if (detail?.project.repositoryOwner) {
+    try {
+      await mirrorHumanGuidanceToForgejo(detail.project, comment.agentRole, comment.body);
+    } catch {
+      // Mirroring is best-effort.
+    }
+  }
   if (deliveryMode !== 'actor_mailbox') return undefined;
   const message = buildHumanGuidanceMessage({
     projectId: comment.projectId,
@@ -1705,9 +1984,79 @@ export async function recordAgentHandoff(
     iteration,
     `🟢 **${role} handoff completed.** ${artifactNames} → ${recipients}.`,
     `${protocolMessage.idempotencyKey}:comment`,
+    role,
   );
   await labelIterationAgent(project, iteration, role);
   return deliveryMode === 'actor_mailbox' ? protocolMessage : undefined;
+}
+
+export async function loadPackagingPlan(
+  artifacts: readonly AgentArtifactReference[],
+): Promise<PackagingPlan> {
+  // Prefer the latest packaging-plan artifact when several are present.
+  const artifact = [...artifacts].reverse().find((candidate) => candidate.type === 'packaging-plan');
+  if (!artifact) return resolvePackagingPlanFromArtifacts(undefined);
+  const content = await loadArtifactReferenceContent(artifact);
+  return resolvePackagingPlanFromArtifacts(content ? [{ type: artifact.type, content }] : undefined);
+}
+
+export async function materializePackagingWorkflow(
+  project: Project,
+  iteration: ProjectIteration,
+  plan: PackagingPlan,
+): Promise<{ path: string; url: string }> {
+  const location = await commitPackagingWorkflow(project, iteration, plan);
+  await (await store()).addEvent({
+    projectId: project.id,
+    iterationNumber: iteration.number,
+    kind: 'system',
+    title: 'Packaging workflow materialized',
+    description: `Committed ${location.path} from the Planner packaging-plan (${plan.checks.map((check) => check.kind).join(', ')}).`,
+    agentRole: 'planner',
+  });
+  await addIterationComment(
+    project,
+    iteration,
+    `📦 Packaging workflow committed at [\`${location.path}\`](${location.url}).`,
+    'planner',
+  );
+  return { path: location.path, url: location.url };
+}
+
+export async function recordPackagingEvidence(
+  project: Project,
+  iteration: ProjectIteration,
+  plan: PackagingPlan,
+  evidence: PackagingEvidence,
+): Promise<AgentArtifactReference> {
+  const draft: AgentArtifactDraft = {
+    type: 'packaging-evidence',
+    name: 'Packaging evidence',
+    content: JSON.stringify(evidence, null, 2),
+    mimeType: 'application/json',
+    producedBy: 'builder',
+    model: 'orchestra-packaging-sandbox',
+  };
+  const artifact = await (await store()).addArtifact(project.id, iteration.id, draft, iteration.number);
+  const location = await commitArtifact(project, iteration, artifact);
+  const located = await (await store()).locateArtifact(artifact.id, location.path, location.url);
+  await createPackagingCommitStatuses(project, evidence.revision, evidence.checks);
+  const satisfied = packagingEvidenceSatisfiesPlan(evidence, plan);
+  await (await store()).addEvent({
+    projectId: project.id,
+    iterationNumber: iteration.number,
+    kind: 'system',
+    title: satisfied ? 'Builder packaging checks passed' : 'Builder packaging check failed',
+    description: satisfied
+      ? `Required packaging checks passed for revision ${evidence.revision.slice(0, 12)}.`
+      : evidence.checks
+        .filter((check) => check.required && check.status !== 'passed')
+        .map((check) => `${check.id}: ${check.summary}`)
+        .join(' ')
+        || 'Required packaging checks did not pass.',
+    agentRole: 'builder',
+  });
+  return toAgentArtifactReference(located);
 }
 
 export async function recordAgentFailure(

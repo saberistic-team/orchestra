@@ -1,8 +1,12 @@
 import type { AgentArtifactDraft, AgentExecutionInput, DynamicExecutionPlan } from '@orchestra/contracts';
 import { describe, expect, it } from 'vitest';
 import {
+  buildDynamicPlanRepairRequest,
+  classifyPlanDrift,
   executeDynamicArtifactOrder,
   MAX_DYNAMIC_ARTIFACT_REVISIONS,
+  normalizeDecisionEnvelope,
+  parseDynamicExecutionPlan,
   type DynamicAgentModelActionRequest,
   type DynamicAgentModelActionResult,
   type DynamicArtifactExecutionGateways,
@@ -169,6 +173,99 @@ function gateways(plans: unknown[]) {
 }
 
 describe('dynamic artifact execution loop', () => {
+  it('parses fenced plan JSON the same way artifact parsing does', () => {
+    expect(parseDynamicExecutionPlan([
+      '```json',
+      JSON.stringify({
+        protocolVersion: '1',
+        goalAssessment: 'Continue.',
+        contextVersion: 0,
+        acknowledgedDecisionIds: [],
+        actions: [],
+        completionCheck: { type: 'continue', reason: 'Need another observation.' },
+      }),
+      '```',
+    ].join('\n'))).toMatchObject({
+      protocolVersion: '1',
+      completionCheck: { type: 'continue' },
+    });
+  });
+
+  it('classifies flattened human-decision drift for plan repair prompts', () => {
+    const invalidOutput = JSON.stringify({
+      protocolVersion: '1',
+      goalAssessment: 'Need a human choice.',
+      contextVersion: 0,
+      acknowledgedDecisionIds: [],
+      actions: [{
+        id: 'review-1',
+        activity: 'model.review_artifact',
+        activityVersion: '1.0',
+        arguments: {},
+        dependsOn: [],
+        reason: 'Review first',
+      }],
+      completionCheck: {
+        type: 'human_input_required',
+        reason: 'Review findings require human validation',
+      },
+      decisionKey: 'dec-rev-final-assessment',
+      options: [
+        { value: 'pass-review', label: 'Pass' },
+        { value: 'regen', label: 'Regenerate' },
+      ],
+      allowCustomAnswer: true,
+      allowAgentDecide: false,
+    });
+    const drift = classifyPlanDrift(invalidOutput, [{
+      code: 'INVALID_PLAN',
+      message: 'completionCheck.decision: Invalid input',
+    }]);
+    expect(drift.kinds).toEqual(expect.arrayContaining([
+      'flattened_decision_fields',
+      'actions_with_terminal_completion',
+    ]));
+    expect(drift.hints.join(' ')).toContain('completionCheck.decision');
+    expect(drift.hints.join(' ')).toContain('actions must be []');
+
+    const repair = buildDynamicPlanRepairRequest(
+      {
+        executionId: 'order-repair-drift',
+        input,
+        contextVersion: 0,
+      },
+      {
+        candidateVersion: 0,
+        revisionCount: 0,
+        usage: {
+          planningRounds: 1,
+          planRepairAttempts: 0,
+          actions: 0,
+          modelCalls: 1,
+          promptTokens: 10,
+          completionTokens: 5,
+          totalTokens: 15,
+          cost: 0,
+        },
+        observations: [],
+        previousActions: [],
+        invocations: [],
+        plans: [],
+        findings: [],
+        noProgressRounds: 0,
+      },
+      1,
+      1,
+      invalidOutput,
+      [{ code: 'INVALID_PLAN', message: 'completionCheck.decision: Invalid input' }],
+    );
+    expect(repair.temperature).toBe(0);
+    expect(repair.messages[1]?.content).toContain('<DETECTED_DRIFT>');
+    expect(repair.messages[1]?.content).toContain('flattened_decision_fields');
+    expect(repair.messages[1]?.content).toContain('<AVOID_IN_REPLACEMENT>');
+    expect(repair.messages[1]?.content).toContain('Do not place them at the plan root');
+  });
+
   it('rejects capability output that violates its strict registered schema', async () => {
     const harness = gateways([
       plan([action('generate', 'model.generate_artifact')]),
@@ -191,6 +288,47 @@ describe('dynamic artifact execution loop', () => {
       status: 'failed',
       error: { code: 'ACTIVITY_FAILED', message: expect.stringContaining('unknown fields') },
     });
+  });
+
+  it('accepts provider reasoning-token usage only after the replay-safe rollout', async () => {
+    const harness = gateways([
+      plan([action('generate-1', 'model.generate_artifact')]),
+      plan([action('review-1', 'model.review_artifact')]),
+      plan([], {
+        type: 'completed',
+        reason: 'The current candidate passed independent review.',
+        evidenceRefs: [],
+      }),
+    ]);
+    const originalAct = harness.gateway.act;
+    harness.gateway.act = async (request, operationKey) => {
+      const result = await originalAct(request, operationKey);
+      if (result.action === 'finalize_candidate') return result;
+      const inferenceKey = result.action === 'quality_review' ? 'inference' : 'candidate';
+      return {
+        ...result,
+        [inferenceKey]: {
+          ...result[inferenceKey],
+          usage: { ...result[inferenceKey].usage, reasoningTokens: 3 },
+        },
+        invocation: {
+          ...result.invocation,
+          usage: { ...result.invocation.usage, reasoningTokens: 3 },
+        },
+      } as DynamicAgentModelActionResult;
+    };
+
+    const result = await executeDynamicArtifactOrder({
+      executionId: 'order-reasoning-usage',
+      input,
+      contextVersion: 1,
+      acceptReasoningTokens: true,
+    }, harness.gateway);
+
+    expect(result.status).toBe('completed');
+    expect(result.trace.invocations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ usage: expect.objectContaining({ reasoningTokens: 3 }) }),
+    ]));
   });
 
   it('rejects runtime limit overrides that exceed the bounded contract', async () => {
@@ -1032,6 +1170,79 @@ describe('dynamic artifact execution loop', () => {
     });
   });
 
+  it('hoists flattened human-decision fields onto completionCheck.decision', async () => {
+    expect(normalizeDecisionEnvelope({
+      protocolVersion: '1',
+      goalAssessment: 'Need a human choice before continuing.',
+      contextVersion: 0,
+      acknowledgedDecisionIds: [],
+      actions: [],
+      completionCheck: {
+        type: 'human_input_required',
+        reason: 'Review findings require human validation to determine if artifact passes or needs regeneration',
+      },
+      decisionKey: 'dec-rev-final-assessment',
+      options: [
+        { value: 'pass-review', label: 'Candidate passes final review - mark as completed' },
+        { value: 'fail-findings-new-gen', label: 'Find issues found - regenerate new candidate' },
+      ],
+      allowCustomAnswer: true,
+      allowAgentDecide: false,
+    }, true)).toMatchObject({
+      completionCheck: {
+        type: 'human_input_required',
+        decision: {
+          decisionKey: 'dec-rev-final-assessment',
+          question: 'Review findings require human validation to determine if artifact passes or needs regeneration',
+          options: [
+            { value: 'pass-review', label: 'Candidate passes final review - mark as completed' },
+            { value: 'fail-findings-new-gen', label: 'Find issues found - regenerate new candidate' },
+          ],
+          allowCustomAnswer: true,
+          allowAgentDecide: false,
+        },
+      },
+    });
+
+    const harness = gateways([{
+      protocolVersion: '1',
+      goalAssessment: 'Need a human choice before continuing.',
+      contextVersion: 0,
+      acknowledgedDecisionIds: [],
+      actions: [],
+      completionCheck: {
+        type: 'human_input_required',
+        reason: 'Candidate reached maximum revisions with no passing review.',
+      },
+      decisionKey: 'requirements.baseline_final_assessment',
+      options: [
+        { value: 'pass-review', label: 'Approve the baseline' },
+        { value: 'regen', label: 'Regenerate a new candidate' },
+      ],
+      allowCustomAnswer: true,
+      allowAgentDecide: false,
+    } as never]);
+
+    const result = await executeDynamicArtifactOrder({
+      executionId: 'order-hoisted-decision-envelope',
+      input,
+      contextVersion: 0,
+      normalizeDecisionEnvelope: true,
+      normalizeDecisionOptions: true,
+      discardTerminalControlActions: true,
+    }, harness.gateway);
+
+    expect(result).toMatchObject({
+      status: 'waiting_for_human',
+      decision: {
+        decisionKey: 'requirements.baseline_final_assessment',
+        question: 'Candidate reached maximum revisions with no passing review.',
+        allowCustomAnswer: true,
+        allowAgentDecide: false,
+      },
+    });
+  });
+
   it('completes instead of repeating review after the current candidate passed', async () => {
     const harness = gateways([
       plan([action('generate-1', 'model.generate_artifact')]),
@@ -1269,6 +1480,7 @@ describe('dynamic artifact execution loop', () => {
       bindPlanningContextVersion: true,
       normalizeArtifactStateTransitions: true,
       refreshCandidateAfterHumanDecision: true,
+      extendPlanningAfterHumanDecision: true,
       checkpoint: waiting.checkpoint,
     }, afterDecision.gateway);
 
@@ -1282,6 +1494,63 @@ describe('dynamic artifact execution loop', () => {
       status: 'revise',
       findings: [expect.stringContaining('newly recorded human decision')],
     });
+  });
+
+  it('grants three new planning rounds when a human decision resumes an exhausted checkpoint', async () => {
+    const decision = {
+      decisionKey: 'requirements.defaults',
+      question: 'May the agent fill reasonable defaults?',
+      options: [
+        { value: 'apply', label: 'Apply reasonable defaults' },
+        { value: 'defer', label: 'Leave questions unresolved' },
+      ],
+      allowCustomAnswer: false,
+      allowAgentDecide: false,
+    } as const;
+    const beforeDecision = gateways([
+      plan([action('generate-1', 'model.generate_artifact')]),
+      plan([action('review-1', 'model.review_artifact')]),
+      plan([], {
+        type: 'human_input_required',
+        reason: 'The draft contains unresolved questions.',
+        decision,
+      }),
+    ]);
+    const waiting = await executeDynamicArtifactOrder({
+      executionId: 'order-exhausted-human-resume',
+      input,
+      contextVersion: 1,
+      limits: { maxPlanningRounds: 3 },
+      normalizeArtifactStateTransitions: true,
+    }, beforeDecision.gateway);
+    if (waiting.status !== 'waiting_for_human') throw new Error('Expected a human-decision checkpoint.');
+
+    const afterDecision = gateways([
+      plan([]),
+      plan([]),
+      plan([], { type: 'completed', reason: 'The resolved charter passed review.', evidenceRefs: [] }),
+    ]);
+    const completed = await executeDynamicArtifactOrder({
+      executionId: waiting.checkpoint.executionId,
+      input: { ...input, context: `${input.context}\nThe human selected the recommended defaults.` },
+      contextVersion: 2,
+      limits: { maxPlanningRounds: 3 },
+      bindPlanningContextVersion: true,
+      normalizeArtifactStateTransitions: true,
+      refreshCandidateAfterHumanDecision: true,
+      extendPlanningAfterHumanDecision: true,
+      checkpoint: waiting.checkpoint,
+    }, afterDecision.gateway);
+
+    expect(completed).toMatchObject({
+      status: 'completed',
+      trace: { usage: { planningRounds: 6 } },
+    });
+    expect(afterDecision.actionRequests.map((request) => request.action)).toEqual([
+      'revise_candidate',
+      'quality_review',
+      'finalize_candidate',
+    ]);
   });
 
   it('honors an acknowledged human acceptance after the bounded revision limit is exhausted', async () => {

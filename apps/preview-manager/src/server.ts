@@ -1,7 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { DockerPreviewManager } from './docker-preview.js';
-import { parsePreviewDeploymentRequest } from './types.js';
+import { parsePackagingBuildChecksRequest, parsePreviewDeploymentRequest } from './types.js';
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -60,12 +60,19 @@ export function createPreviewServer(manager: DockerPreviewManager, token: string
         return json(response, 503, { status: 'unavailable' });
       }
     }
-    if (request.method !== 'POST' || url.pathname !== '/previews') return json(response, 404, { error: 'Not found.' });
+    if (request.method !== 'POST' || (url.pathname !== '/previews' && url.pathname !== '/build-checks')) {
+      return json(response, 404, { error: 'Not found.' });
+    }
     if (!authenticated(request, token)) return json(response, 401, { error: 'Unauthorized.' });
     if (!request.headers['content-type']?.toLowerCase().startsWith('application/json')) {
       return json(response, 415, { error: 'Content-Type must be application/json.' });
     }
     try {
+      if (url.pathname === '/build-checks') {
+        const input = parsePackagingBuildChecksRequest(await readJson(request));
+        const result = await manager.runBuildChecks(input);
+        return json(response, 201, result);
+      }
       const input = parsePreviewDeploymentRequest(await readJson(request));
       const deployment = await manager.deploy(input);
       return json(response, 201, deployment);

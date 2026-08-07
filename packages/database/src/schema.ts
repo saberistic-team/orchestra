@@ -4,6 +4,7 @@ import {
   type AnyPgColumn,
   boolean,
   check,
+  customType,
   index,
   integer,
   jsonb,
@@ -14,6 +15,12 @@ import {
   uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
+
+const bytea = customType<{ data: Buffer; driverData: Buffer }>({
+  dataType() {
+    return 'bytea';
+  },
+});
 
 export const projectStatuses = ['discovering', 'defining', 'planning', 'building', 'reviewing', 'awaiting_approval', 'blocked', 'completed'] as const;
 
@@ -76,19 +83,10 @@ export const projects = pgTable('projects', {
   repositoryUrl: text('repository_url'),
   repositoryOwner: text('repository_owner'),
   repositoryName: text('repository_name'),
+  forgejoProjectId: integer('forgejo_project_id'),
   createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
 });
-
-export const temporalPayloadBlobs = pgTable('temporal_payload_blobs', {
-  digest: text('digest').primaryKey(),
-  dataBase64: text('data_base64').notNull(),
-  metadata: jsonb('metadata').$type<Record<string, string>>().notNull().default({}),
-  byteLength: integer('byte_length').notNull(),
-  createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
-}, (table) => [
-  check('temporal_payload_blobs_byte_length_nonnegative', sql`${table.byteLength} >= 0`),
-]);
 
 export const iterations = pgTable('project_iterations', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -103,6 +101,23 @@ export const iterations = pgTable('project_iterations', {
   pullRequestNumber: integer('pull_request_number'),
   pullRequestUrl: text('pull_request_url'),
 }, (table) => [uniqueIndex('project_iteration_number').on(table.projectId, table.number)]);
+
+export const iterationWorkIssues = pgTable('iteration_work_issues', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+  iterationId: uuid('iteration_id').notNull().references(() => iterations.id, { onDelete: 'cascade' }),
+  issueNumber: integer('issue_number').notNull(),
+  packageKey: text('package_key'),
+  title: text('title').notNull(),
+  createdByRole: text('created_by_role').$type<AgentRole>().notNull(),
+  parentIssueNumber: integer('parent_issue_number'),
+  createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex('iteration_work_issue_number').on(table.iterationId, table.issueNumber),
+  uniqueIndex('iteration_work_issue_package_key')
+    .on(table.iterationId, table.packageKey)
+    .where(sql`${table.packageKey} IS NOT NULL`),
+]);
 
 export const projectEvents = pgTable('project_events', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -1056,3 +1071,16 @@ export const iterationReviewProposalsRelations = relations(iterationReviewPropos
   iteration: one(iterations, { fields: [iterationReviewProposals.iterationId], references: [iterations.id] }),
   proposedBy: one(agents, { fields: [iterationReviewProposals.proposedByAgentId], references: [agents.id] }),
 }));
+
+/** Content-addressed Temporal External Storage payloads (claim-check offload). */
+export const temporalPayloads = pgTable('temporal_payloads', {
+  hashSha256: text('hash_sha256').primaryKey(),
+  payload: bytea('payload').notNull(),
+  sizeBytes: integer('size_bytes').notNull(),
+  namespace: text('namespace'),
+  targetKind: text('target_kind'),
+  targetType: text('target_type'),
+  targetId: text('target_id'),
+  runId: text('run_id'),
+  createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+});

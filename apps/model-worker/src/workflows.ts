@@ -14,7 +14,6 @@ import {
   executeChild,
   getExternalWorkflowHandle,
   proxyActivities,
-  patched,
   setHandler,
   workflowInfo,
 } from '@temporalio/workflow';
@@ -56,20 +55,10 @@ function assertInferenceDeadlineOpen(inference: OllamaInferenceRequest) {
 }
 
 interface InferenceActivities {
-  ollamaInference(request: OllamaInferenceRequest): Promise<OllamaInferenceResult>;
   ollamaProviderInference(request: BoundInferenceRequest): Promise<OllamaInferenceResult>;
   openRouterInference(request: BoundInferenceRequest): Promise<OllamaInferenceResult>;
   resolveInferencePolicy(role?: AgentExecutionInput['role']): Promise<InferenceRoutingPolicy>;
 }
-
-const legacyInferenceActivities = proxyActivities<Pick<InferenceActivities, 'ollamaInference'>>({
-  taskQueue: OLLAMA_INFERENCE_TASK_QUEUE,
-  startToCloseTimeout: '30 minutes',
-  scheduleToCloseTimeout: '2 hours',
-  // Retrying an ambiguous timeout could overlap the prior HTTP call. A new
-  // model interaction must be started deliberately instead.
-  retry: { maximumAttempts: 1 },
-});
 
 const ollamaActivities = proxyActivities<Pick<InferenceActivities, 'ollamaProviderInference'>>({
   taskQueue: OLLAMA_INFERENCE_TASK_QUEUE,
@@ -288,21 +277,6 @@ export async function modelInteractionWorkflow(
   input: AgentExecutionInput,
 ): Promise<AgentArtifactDraft> {
   const execution = workflowInfo();
-  const providerBoundRouting = patched('provider-bound-inference-v1');
-  const visibleOpenRouterRequests = providerBoundRouting
-    && patched('openrouter-request-workflow-v1');
-  const perRequestRouting = providerBoundRouting
-    && patched('per-request-inference-routing-v1');
-  const interactionPolicy = providerBoundRouting
-    ? perRequestRouting
-      ? undefined
-      : await policyActivities.resolveInferencePolicy(input.role)
-    : await proxyActivities<Pick<InferenceActivities, 'resolveInferencePolicy'>>({
-      taskQueue: OLLAMA_INFERENCE_TASK_QUEUE,
-      startToCloseTimeout: '30 seconds',
-      scheduleToCloseTimeout: '2 minutes',
-      retry: { maximumAttempts: 3 },
-    }).resolveInferencePolicy();
   const responses = new Map<string, OllamaInferenceLaneResponse>();
   let requestSequence = 0;
 
@@ -312,28 +286,13 @@ export async function modelInteractionWorkflow(
 
   try {
     return await executeModelInteraction(input, async (inference) => {
-      if (!providerBoundRouting) {
-        return await legacyInferenceActivities.ollamaInference(inference);
-      }
-
-      const policy = perRequestRouting
-        ? await policyActivities.resolveInferencePolicy(inference.role)
-        : interactionPolicy;
-      if (!policy) {
-        throw ApplicationFailure.nonRetryable(
-          `No inference route was resolved for ${inference.role}.`,
-          'InferenceRouteMissing',
-        );
-      }
+      const policy = await policyActivities.resolveInferencePolicy(inference.role);
       const boundInference: BoundInferenceRequest = {
         ...inference,
         provider: policy.provider,
         model: policy.model,
       };
       if (!policy.serialize) {
-        if (!visibleOpenRouterRequests) {
-          return await openRouterActivities.openRouterInference(boundInference);
-        }
         requestSequence += 1;
         const remainingMs = assertInferenceDeadlineOpen(inference);
         return await executeChild<typeof openRouterInferenceWorkflow>('openRouterInferenceWorkflow', {

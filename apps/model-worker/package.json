@@ -11,10 +11,12 @@
   "dependencies": {
     "@orchestra/contracts": "workspace:*",
     "@orchestra/database": "workspace:*",
+    "@orchestra/temporal-codec": "workspace:*",
     "@temporalio/activity": "^1.21.1",
     "@temporalio/client": "^1.21.1",
+    "@temporalio/worker": "^1.21.1",
     "@temporalio/workflow": "^1.21.1",
-    "@temporalio/worker": "^1.21.1"
+    "redis": "^5.12.1"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",

@@ -7,10 +7,15 @@ import {
   ollamaInference,
   ollamaProviderInference,
   promptTokenUpperBound,
+  parseOpenRouterUsage,
   resolveInferencePolicy,
   resolveOpenRouterRequestPolicy,
 } from './activities.js';
 import type { OllamaInferenceRequest } from './model-protocol.js';
+import {
+  configureBudgetPriorStore,
+  createMemoryBudgetPriorStore,
+} from './openrouter-budget-learning.js';
 
 const request: OllamaInferenceRequest = {
   role: 'requirements',
@@ -27,6 +32,7 @@ let server: Server | undefined;
 
 afterEach(async () => {
   vi.unstubAllEnvs();
+  configureBudgetPriorStore(undefined);
   await new Promise<void>((resolve, reject) => {
     if (!server) return resolve();
     server.close((error) => (error ? reject(error) : resolve()));
@@ -287,13 +293,20 @@ describe('OpenRouter inference Activity boundary', () => {
       maxTokens: 4096,
       retryMaxTokens: 8192,
       reasoningTokens: 512,
+      hardMaxTokens: 16384,
+      budgetBumps: 2,
       timeoutMs: 240000,
       attempts: 2,
       provider: { sort: 'latency', require_parameters: false },
     });
-    expect(resolveOpenRouterRequestPolicy({ ...manager, role: 'builder' }, {})).toMatchObject({
+    expect(resolveOpenRouterRequestPolicy({
+      ...manager,
+      role: 'builder',
+      model: 'qwen/qwen3-coder',
+    }, {})).toMatchObject({
       maxTokens: 12288,
       reasoningTokens: 1536,
+      hardMaxTokens: 32768,
       timeoutMs: 600000,
       provider: { sort: 'throughput', require_parameters: false },
     });
@@ -309,6 +322,7 @@ describe('OpenRouter inference Activity boundary', () => {
     }, {})).toMatchObject({
       maxTokens: 4096,
       reasoningTokens: 512,
+      hardMaxTokens: 32768,
       provider: { sort: 'latency', require_parameters: false },
     });
     expect(resolveOpenRouterRequestPolicy({
@@ -318,6 +332,8 @@ describe('OpenRouter inference Activity boundary', () => {
     }, {})).toMatchObject({
       maxTokens: 4096,
       reasoningTokens: 0,
+      hardMaxTokens: 16384,
+      hardReasoningTokens: 0,
       timeoutMs: 240000,
       provider: { sort: 'latency', require_parameters: false },
     });
@@ -366,6 +382,42 @@ describe('OpenRouter inference Activity boundary', () => {
       OPENROUTER_MAX_TOKENS_MANAGER_PLAN_REPAIR: '1536',
       OPENROUTER_REASONING_MAX_TOKENS_PLAN_REPAIR: '256',
     })).toMatchObject({ maxTokens: 1536, reasoningTokens: 256 });
+    expect(resolveOpenRouterRequestPolicy(manager, {
+      OPENROUTER_MAX_TOKENS: '100000',
+      OPENROUTER_MAX_TOKENS_HARD_LIMIT: '8192',
+    })).toMatchObject({ maxTokens: 8192, hardMaxTokens: 8192 });
+    expect(resolveOpenRouterRequestPolicy({
+      ...manager,
+      role: 'builder',
+      model: 'qwen/qwen3-coder',
+    }, {
+      OPENROUTER_BUDGET_LEARNING: 'true',
+      OPENROUTER_BUDGET_HEADROOM: '1.35',
+    }, {
+      prior: {
+        promptEwma: 1_000,
+        completionEwma: 10_000,
+        reasoningEwma: 2_000,
+        samples: 3,
+        updatedAt: '2026-08-05T00:00:00.000Z',
+      },
+    })).toMatchObject({
+      maxTokens: Math.ceil(10_000 * 1.35),
+      reasoningTokens: Math.ceil(2_000 * 1.35),
+    });
+    expect(parseOpenRouterUsage({
+      prompt_tokens: 11,
+      completion_tokens: 40,
+      total_tokens: 51,
+      cost: 0.01,
+      completion_tokens_details: { reasoning_tokens: 12 },
+    })).toEqual({
+      promptTokens: 11,
+      completionTokens: 40,
+      reasoningTokens: 12,
+      totalTokens: 51,
+      cost: 0.01,
+    });
   });
 
   it('assembles streaming OpenRouter chunks and returns final usage', async () => {
@@ -574,6 +626,7 @@ describe('OpenRouter inference Activity boundary', () => {
     vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
     vi.stubEnv('OPENROUTER_ALLOW_REMOTE_DATA', 'true');
     vi.stubEnv('OPENROUTER_HTTP_ATTEMPTS', '2');
+    vi.stubEnv('OPENROUTER_BUDGET_BUMPS', '0');
     let calls = 0;
     const port = await listen((_req, res) => {
       calls += 1;
@@ -587,8 +640,162 @@ describe('OpenRouter inference Activity boundary', () => {
     vi.stubEnv('OPENROUTER_BASE_URL', `http://127.0.0.1:${port}/api/v1`);
 
     await expect(ollamaInference({ ...request, purpose: 'revise' })).rejects.toThrow(
-      /after 2 attempts \(requestId=empty-2, finishReason=length, nativeFinishReason=max_tokens, completionTokens=8192, totalTokens=9000\)/,
+      /after 2 attempts \(requestId=empty-2, finishReason=length, nativeFinishReason=max_tokens, completionTokens=8192, totalTokens=9000, budgetAttempt=0, maxTokens=4096, reasoningTokens=512\)/,
     );
     expect(calls).toBe(2);
+  });
+
+  it('bumps max_tokens after a length cutoff and retries', async () => {
+    vi.stubEnv('MODEL_PROVIDER', 'openrouter');
+    vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+    vi.stubEnv('OPENROUTER_ALLOW_REMOTE_DATA', 'true');
+    vi.stubEnv('OPENROUTER_BUDGET_BUMPS', '2');
+    const maxTokens: number[] = [];
+    const port = await listen((req, res) => {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        const parsed = JSON.parse(body) as { max_tokens?: number };
+        maxTokens.push(parsed.max_tokens ?? 0);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        if (maxTokens.length === 1) {
+          res.end(JSON.stringify({
+            id: 'cut-1',
+            choices: [{ finish_reason: 'length', message: { content: '{"content":"partial' } }],
+          }));
+          return;
+        }
+        res.end(JSON.stringify({
+          id: 'cut-2',
+          choices: [{ finish_reason: 'stop', message: { content: '{"content":"complete"}' } }],
+        }));
+      });
+    });
+    vi.stubEnv('OPENROUTER_BASE_URL', `http://127.0.0.1:${port}/api/v1`);
+
+    await expect(ollamaInference(request)).resolves.toMatchObject({
+      requestId: 'cut-2',
+      content: '{"content":"complete"}',
+    });
+    expect(maxTokens[0]).toBe(4096);
+    expect(maxTokens[1]).toBeGreaterThan(4096);
+  });
+
+  it('bumps after truncated JSON without a length finish reason', async () => {
+    vi.stubEnv('MODEL_PROVIDER', 'openrouter');
+    vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+    vi.stubEnv('OPENROUTER_ALLOW_REMOTE_DATA', 'true');
+    vi.stubEnv('OPENROUTER_BUDGET_BUMPS', '1');
+    let calls = 0;
+    const port = await listen((_req, res) => {
+      calls += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(calls === 1 ? {
+        choices: [{ finish_reason: 'stop', message: { content: '{"content":' } }],
+      } : {
+        choices: [{ finish_reason: 'stop', message: { content: '{"content":"ok"}' } }],
+      }));
+    });
+    vi.stubEnv('OPENROUTER_BASE_URL', `http://127.0.0.1:${port}/api/v1`);
+
+    await expect(ollamaInference(request)).resolves.toMatchObject({ content: '{"content":"ok"}' });
+    expect(calls).toBe(2);
+  });
+
+  it('records successful usage into the budget prior store and raises later starts', async () => {
+    vi.stubEnv('MODEL_PROVIDER', 'openrouter');
+    vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+    vi.stubEnv('OPENROUTER_ALLOW_REMOTE_DATA', 'true');
+    vi.stubEnv('OPENROUTER_BUDGET_LEARNING', 'true');
+    vi.stubEnv('OPENROUTER_BUDGET_HEADROOM', '1.35');
+    const store = createMemoryBudgetPriorStore();
+    configureBudgetPriorStore(store);
+    const port = await listen((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'learned-1',
+        usage: {
+          prompt_tokens: 900,
+          completion_tokens: 5_000,
+          total_tokens: 5_900,
+          completion_tokens_details: { reasoning_tokens: 400 },
+        },
+        choices: [{ finish_reason: 'stop', message: { content: '{"content":"learned"}' } }],
+      }));
+    });
+    vi.stubEnv('OPENROUTER_BASE_URL', `http://127.0.0.1:${port}/api/v1`);
+
+    await expect(ollamaInference(request)).resolves.toMatchObject({
+      usage: { promptTokens: 900, completionTokens: 5_000, reasoningTokens: 400 },
+    });
+    const entries = [...store.snapshot().entries()];
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.[0]).toMatch(/^orchestra:openrouter-budget:requirements:generate:/);
+    expect(entries[0]?.[1]).toMatchObject({
+      samples: 1,
+      completionEwma: 4_600,
+      reasoningEwma: 400,
+    });
+    const learnedModel = entries[0]![0].replace('orchestra:openrouter-budget:requirements:generate:', '');
+    expect(resolveOpenRouterRequestPolicy({
+      ...request,
+      provider: 'openrouter',
+      model: learnedModel,
+    }, {
+      OPENROUTER_BUDGET_LEARNING: 'true',
+      OPENROUTER_BUDGET_HEADROOM: '1.35',
+    }, { prior: entries[0]![1] })).toMatchObject({
+      maxTokens: Math.ceil(4_600 * 1.35),
+      reasoningTokens: Math.max(512, Math.ceil(400 * 1.35)),
+    });
+  });
+
+  it('keeps heuristic starts when the prior store is unavailable', async () => {
+    vi.stubEnv('MODEL_PROVIDER', 'openrouter');
+    vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+    vi.stubEnv('OPENROUTER_ALLOW_REMOTE_DATA', 'true');
+    vi.stubEnv('OPENROUTER_BUDGET_LEARNING', 'true');
+    // No REDIS_URL and no injected store → learning is a no-op.
+    configureBudgetPriorStore(undefined);
+    const maxTokens: number[] = [];
+    const port = await listen((req, res) => {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        maxTokens.push((JSON.parse(body) as { max_tokens?: number }).max_tokens ?? 0);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{ finish_reason: 'stop', message: { content: '{"content":"ok"}' } }],
+        }));
+      });
+    });
+    vi.stubEnv('OPENROUTER_BASE_URL', `http://127.0.0.1:${port}/api/v1`);
+
+    await expect(ollamaInference(request)).resolves.toMatchObject({ content: '{"content":"ok"}' });
+    expect(maxTokens[0]).toBe(4096);
+  });
+
+  it('fails clearly when incomplete output reaches the hard token limit', async () => {
+    vi.stubEnv('MODEL_PROVIDER', 'openrouter');
+    vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+    vi.stubEnv('OPENROUTER_ALLOW_REMOTE_DATA', 'true');
+    vi.stubEnv('OPENROUTER_MAX_TOKENS', '2048');
+    vi.stubEnv('OPENROUTER_MAX_TOKENS_HARD_LIMIT', '2048');
+    vi.stubEnv('OPENROUTER_BUDGET_BUMPS', '2');
+    let calls = 0;
+    const port = await listen((_req, res) => {
+      calls += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: `hard-${calls}`,
+        choices: [{ finish_reason: 'length', message: { content: '{"content":' } }],
+      }));
+    });
+    vi.stubEnv('OPENROUTER_BASE_URL', `http://127.0.0.1:${port}/api/v1`);
+
+    await expect(ollamaInference(request)).rejects.toThrow(/exhausted token budgets.*hardMaxTokens=2048/);
+    expect(calls).toBe(1);
   });
 });

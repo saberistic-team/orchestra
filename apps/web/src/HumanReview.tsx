@@ -19,10 +19,17 @@ interface HumanReviewWorkspaceProps {
   onReload: () => Promise<void>;
 }
 
-interface IterationEvidenceGroup {
-  iteration: ProjectIteration;
-  producers: Array<{ role: AgentRole; artifacts: ProjectArtifact[] }>;
-  artifactCount: number;
+interface AgentArtifactGroup {
+  role: AgentRole;
+  label: string;
+  icon: string;
+  artifacts: ProjectArtifact[];
+}
+
+  interface IterationEvidenceGroup {
+    iteration: ProjectIteration;
+    artifacts: ProjectArtifact[];
+    agentGroups: AgentArtifactGroup[];
   videos: ProjectMedia[];
 }
 
@@ -84,29 +91,29 @@ function IterationEvidence({
 }) {
   const id = useId();
   return <section className="review-evidence" aria-labelledby={`${id}-title`}>
-    <div className="review-section-heading"><div><p className="eyebrow">Review package</p><h2 id={`${id}-title`}>Evidence by iteration</h2></div><p>Open an artifact for a full-size reading view and leave feedback tied to that exact version.</p></div>
-    <div className="review-evidence__groups">{groups.map(({ iteration, producers, artifactCount, videos }) => <section className="iteration-evidence" key={iteration.id} aria-labelledby={`${id}-iteration-${iteration.number}`}>
+    <div className="review-section-heading"><div><p className="eyebrow">Review package</p><h2 id={`${id}-title`}>Evidence by iteration</h2></div><p>Artifacts are grouped by the agent that produced them in each iteration. Open one for a full-size reading view and leave feedback tied to that exact version.</p></div>
+    <div className="review-evidence__groups">{groups.map(({ iteration, artifacts, agentGroups, videos }) => <section className="iteration-evidence" key={iteration.id} aria-labelledby={`${id}-iteration-${iteration.number}`}>
       <div className="iteration-evidence__heading">
         <div><span>{iteration.number === currentIteration ? 'Current review' : 'Previous iteration'}</span><h3 id={`${id}-iteration-${iteration.number}`}>Iteration {iteration.number} review evidence</h3><p>{iteration.objective}</p></div>
         <span className={`iteration-evidence__status iteration-evidence__status--${iteration.status}`}>{iteration.status.replaceAll('_', ' ')}</span>
       </div>
 
       <div className="iteration-evidence__section">
-        <div className="iteration-evidence__label"><h4>Artifacts by agent</h4><span>{artifactCount}</span></div>
-        {producers.length > 0 ? <div className="artifact-producer-list">{producers.map(({ role, artifacts }) => <details className="artifact-producer" key={role}>
-          <summary>
-            <span className="artifact-producer__identity"><i aria-hidden="true">{agentRoleDefinitions.find((definition) => definition.role === role)?.icon ?? '•'}</i><span><strong>{roleLabel(role)}</strong><small>{artifacts.length} {artifacts.length === 1 ? 'artifact' : 'artifacts'}</small></span></span>
-            <span className="artifact-producer__preview">{artifacts.slice(0, 2).map((artifact) => artifact.name).join(' · ')}{artifacts.length > 2 ? ` · +${artifacts.length - 2}` : ''}</span>
-            <b aria-hidden="true">⌄</b>
-          </summary>
-          <div className="artifact-compact-grid">{artifacts.map((artifact) => <button type="button" className="artifact-compact" key={artifact.id} onClick={(event) => onOpenArtifact(artifact, event.currentTarget)} aria-label={`Open ${artifact.name}, version ${artifact.version}`}>
+        <div className="iteration-evidence__label"><h4>Artifacts by agent</h4><span>{artifacts.length}</span></div>
+        {agentGroups.length > 0 ? <div className="artifact-agent-groups">{agentGroups.map((group) => <section className="artifact-agent-group" key={group.role} aria-labelledby={`${id}-iteration-${iteration.number}-agent-${group.role}`}>
+          <div className="artifact-agent-group__heading" id={`${id}-iteration-${iteration.number}-agent-${group.role}`}>
+            <span aria-hidden="true">{group.icon}</span>
+            <strong>{group.label}</strong>
+            <em>{group.artifacts.length}</em>
+          </div>
+          <div className="artifact-compact-grid">{group.artifacts.map((artifact) => <button type="button" className="artifact-compact" key={artifact.id} onClick={(event) => onOpenArtifact(artifact, event.currentTarget)} aria-label={`Open ${artifact.name} from ${group.label}, version ${artifact.version}`}>
             <span className="artifact-compact__top"><i aria-hidden="true">{artifactIcon(artifact)}</i><span>{humanizeMimeType(artifact.mimeType)}</span></span>
             <strong>{artifact.name}</strong>
             <span className="artifact-compact__meta"><span>v{artifact.version}</span><span>{artifact.status.replaceAll('_', ' ')}</span></span>
             <span className="artifact-compact__action">Open full artifact <b aria-hidden="true">↗</b></span>
             {artifactFeedback[artifact.id]?.trim() ? <em>Feedback added ✓</em> : null}
           </button>)}</div>
-        </details>)}</div> : <p className="iteration-evidence__empty">No artifacts were attached to this iteration.</p>}
+        </section>)}</div> : <p className="iteration-evidence__empty">No artifacts were attached to this iteration.</p>}
       </div>
 
       <div className="iteration-evidence__section iteration-evidence__section--journeys">
@@ -398,20 +405,48 @@ function buildEvidenceGroups(detail: ProjectDetail): IterationEvidenceGroup[] {
       const artifacts = detail.artifacts
         .filter((artifact) => artifact.iterationId === iteration.id)
         .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
-      const byProducer = new Map<AgentRole, ProjectArtifact[]>();
-      for (const artifact of artifacts) {
-        const group = byProducer.get(artifact.producedBy) ?? [];
-        group.push(artifact);
-        byProducer.set(artifact.producedBy, group);
-      }
       return {
         iteration,
-        producers: [...byProducer].map(([role, producerArtifacts]) => ({ role, artifacts: producerArtifacts })),
-        artifactCount: artifacts.length,
-        videos: detail.media.filter((media) => media.kind === 'user_flow_video' && media.iterationId === iteration.id).sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt)),
+        artifacts,
+        agentGroups: groupArtifactsByAgent(artifacts),
+        videos: detail.media
+          .filter((media) => media.kind === 'user_flow_video' && media.iterationId === iteration.id)
+          .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt)),
       };
     })
-    .filter((group) => group.iteration.number === detail.project.currentIteration || group.artifactCount > 0 || group.videos.length > 0);
+    .filter((group) => group.iteration.number === detail.project.currentIteration || group.artifacts.length > 0 || group.videos.length > 0);
+}
+
+function groupArtifactsByAgent(artifacts: ProjectArtifact[]): AgentArtifactGroup[] {
+  const byRole = new Map<AgentRole, ProjectArtifact[]>();
+  for (const artifact of artifacts) {
+    const current = byRole.get(artifact.producedBy) ?? [];
+    current.push(artifact);
+    byRole.set(artifact.producedBy, current);
+  }
+
+  const known = agentRoleDefinitions.flatMap((definition) => {
+    const roleArtifacts = byRole.get(definition.role);
+    if (!roleArtifacts) return [];
+    byRole.delete(definition.role);
+    return [{
+      role: definition.role,
+      label: definition.label,
+      icon: definition.icon,
+      artifacts: roleArtifacts,
+    }];
+  });
+
+  const unknown = [...byRole.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([role, roleArtifacts]) => ({
+      role,
+      label: roleLabel(role),
+      icon: '◇',
+      artifacts: roleArtifacts,
+    }));
+
+  return [...known, ...unknown];
 }
 
 function persistedArtifactFeedback(detail: ProjectDetail): FeedbackMap<string> {

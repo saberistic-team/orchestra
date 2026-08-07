@@ -54,8 +54,6 @@ Multiple processes may poll the same role or brain queue when load-balanced capa
 
 ## History compatibility
 
-Existing project workflows keep the original `orchestra-projects` route. Queue and interpreter changes inside workflow code are protected by Temporal patch markers. The project worker continues registering legacy activity handlers on the old queue while existing histories drain, and the model brain process keeps the legacy `orchestra-models` activity queue available. Persistent actors migrate to their role queue and dynamic interpreter at a safe Continue-As-New boundary. The project coordinator also rolls over at clean review boundaries after draining durable human handlers; it carries bounded iteration/reactivation state and reuses the already-running actor workflow IDs. Histories that began under the generate/review/revise protocol retain that recorded path; replay never asks the model to recreate it.
-
-Removing either compatibility lane is an explicit migration after replay tests confirm that no running workflow still references it.
+New project runs use the current queue layout and dynamic interpreter directly. Persistent role actors Continue-As-New onto their role queues at safe boundaries. The project coordinator rolls over at clean review boundaries after draining durable human handlers; it carries bounded iteration/reactivation state and reuses the already-running actor workflow IDs. Replay still consumes recorded child results and Activities from history and never asks the model to recreate a prior plan.
 
 See [dynamic agent execution](DYNAMIC_AGENT_EXECUTION.md) for plan validation, capability execution, budgets, human waits, completion authority, and audit requirements.

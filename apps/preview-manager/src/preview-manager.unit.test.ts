@@ -3,7 +3,7 @@ import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import * as tar from 'tar-stream';
 import { PREVIEW_RUNTIME_CONTRACT } from '@orchestra/contracts';
-import { previewContainerOptions } from './docker-preview.js';
+import { previewContainerOptions } from './docker-ops.js';
 import { archiveInternals, ForgejoSourceClient } from './forgejo-source.js';
 import { parsePreviewDeploymentRequest } from './types.js';
 
@@ -60,6 +60,10 @@ describe('managed preview boundary', () => {
       labels: {},
     });
     expect(options.User).toBe('65532:65532');
+    expect(options.Healthcheck?.Test).toEqual([
+      'CMD-SHELL',
+      'wget -q --spider http://127.0.0.1:8080/health || curl -fsS http://127.0.0.1:8080/health >/dev/null || exit 1',
+    ]);
     expect(options.HostConfig).toMatchObject({
       NetworkMode: 'isolated',
       Privileged: false,
