@@ -16,13 +16,13 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@temporalio/common": "^1.21.1",
-    "@temporalio/proto": "^1.21.1",
+    "@temporalio/common": "^1.22.0",
+    "@temporalio/proto": "^1.22.0",
     "pg": "^8.22.0"
   },
   "devDependencies": {
-    "@types/node": "^26.1.2",
-    "@types/pg": "^8.20.3",
+    "@types/node": "^26.2.0",
+    "@types/pg": "^8.21.0",
     "typescript": "^7.0.2"
   }
 }
