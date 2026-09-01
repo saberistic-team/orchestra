@@ -13,13 +13,13 @@
     "@orchestra/contracts": "workspace:*",
     "@orchestra/database": "workspace:*",
     "@orchestra/temporal-codec": "workspace:*",
-    "@temporalio/activity": "^1.21.1",
-    "@temporalio/worker": "^1.21.1",
-    "@temporalio/workflow": "^1.21.1"
+    "@temporalio/activity": "^1.23.0",
+    "@temporalio/worker": "^1.23.0",
+    "@temporalio/workflow": "^1.23.0"
   },
   "devDependencies": {
-    "@types/node": "^26.1.2",
-    "tsx": "^4.23.5",
+    "@types/node": "^26.4.0",
+    "tsx": "^4.23.12",
     "typescript": "^7.0.2"
   }
 }

@@ -21,11 +21,11 @@
   "dependencies": {
     "@orchestra/contracts": "workspace:*",
     "drizzle-orm": "^0.45.2",
-    "pg": "^8.22.0"
+    "pg": "^8.23.0"
   },
   "devDependencies": {
-    "@types/node": "^26.1.2",
-    "@types/pg": "^8.20.3",
+    "@types/node": "^26.4.0",
+    "@types/pg": "^8.23.1",
     "drizzle-kit": "^0.31.10",
     "typescript": "^7.0.2"
   }
