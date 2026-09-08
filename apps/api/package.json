@@ -10,24 +10,24 @@
     "test": "node --test"
   },
   "dependencies": {
-    "@nestjs/common": "^11.1.28",
-    "@nestjs/core": "^11.1.28",
-    "@nestjs/platform-fastify": "^11.1.28",
+    "@nestjs/common": "^12.0.1",
+    "@nestjs/core": "^12.0.1",
+    "@nestjs/platform-fastify": "^12.0.1",
     "@orchestra/contracts": "workspace:*",
     "@orchestra/database": "workspace:*",
     "@orchestra/temporal-codec": "workspace:*",
-    "@temporalio/client": "^1.21.1",
-    "fastify": "^5.11.2",
+    "@temporalio/client": "^1.23.0",
+    "fastify": "^5.12.3",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
-    "zod": "^4.4.3"
+    "zod": "^4.5.4"
   },
   "devDependencies": {
-    "@types/node": "^26.1.2",
+    "@types/node": "^26.4.1",
     "@types/supertest": "^7.2.1",
-    "@nestjs/testing": "^11.1.28",
+    "@nestjs/testing": "^12.0.1",
     "supertest": "^7.2.2",
-    "tsx": "^4.23.5",
+    "tsx": "^4.23.13",
     "typescript": "^7.0.2"
   }
 }
