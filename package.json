@@ -29,9 +29,9 @@
     "verify:temporal-boundary": "node scripts/verify-temporal-boundary.mjs"
   },
   "devDependencies": {
-    "@playwright/test": "^1.62.1",
-    "@testcontainers/postgresql": "^12.0.4",
+    "@playwright/test": "^1.63.0",
+    "@testcontainers/postgresql": "^12.1.0",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.10"
+    "vitest": "^5.0.0"
   }
 }
