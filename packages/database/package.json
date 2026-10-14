@@ -20,13 +20,13 @@
   },
   "dependencies": {
     "@orchestra/contracts": "workspace:*",
-    "drizzle-orm": "^0.45.2",
-    "pg": "^8.22.0"
+    "drizzle-orm": "^0.45.4",
+    "pg": "^8.23.1"
   },
   "devDependencies": {
-    "@types/node": "^26.1.2",
-    "@types/pg": "^8.20.3",
-    "drizzle-kit": "^0.31.10",
+    "@types/node": "^26.6.5",
+    "@types/pg": "^8.23.1",
+    "drizzle-kit": "^0.31.11",
     "typescript": "^7.0.2"
   }
 }
