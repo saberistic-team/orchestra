@@ -11,12 +11,12 @@
   "dependencies": {
     "@orchestra/contracts": "workspace:*",
     "dockerode": "^5.0.1",
-    "tar-stream": "^3.2.0"
+    "tar-stream": "^3.2.2"
   },
   "devDependencies": {
-    "@types/dockerode": "^4.0.1",
-    "@types/node": "^26.1.2",
-    "tsx": "^4.23.5",
+    "@types/dockerode": "^4.0.2",
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }
 }
